@@ -5,6 +5,30 @@
 > 预计内存：5-15 MB RSS（vs Node.js 的 150-300 MB）
 > 预计工期：5 个 Goal，每个 Goal 约 1-2 小时
 
+## ✅ 执行状态（2026-11-01 完成）
+
+全部 5 个 Goal 已完成并通过全量测试：
+
+| Goal | 内容 | 状态 |
+|---|---|---|
+| W1 | 布局引擎 + 侧边栏 + UI 组件（ui.rs / web.rs） | ✅ 完成 |
+| W2 | 基础建设 + 问题池 7 页面（pages.rs） | ✅ 完成 |
+| W3 | 内容/发布/监测 8 页面（pages2.rs） | ✅ 完成 |
+| W4 | 信源/报告/系统设置/团队/一键GEO（pages3.rs） | ✅ 完成 |
+| W5 | 全量测试 + 切换 | ✅ 完成 |
+
+**测试结果**：`bash scripts/rust-full-test.sh` → 88 项检查全部通过（页面路由 27 项 / 业务闭环 32 项 / 数据完整性 9 项 / 安全 8 项等），本地连续两次零失败；`cargo test` 19/19；本地 release 版 RSS ≈ 9.6 MB。
+
+**生产部署（2026-11-01）**：已部署至 120.46.133.88（`geo-rust.service`，端口 3438，数据库指向 `/opt/geo/platform/data/geo.db`），88 项全量测试在线上复跑全部通过。注意：服务器上 demo@geo.local 的历史密码与文档默认值不符（已被改动），已重置为 `demo1234`（以 Node 兼容 scrypt 写入，Node 版也可验证）。部署前备份：`/opt/geo/platform/data/geo.db.bak-20261101-221121`、旧二进制 `/opt/geo-rust/geo-platform.bak-20261101-221121`。测试产生的数据与更早的 FullTest 残留均已清理，用户数据（跃动童年、LikeClaw 项目）未动。
+
+**实现要点**：
+- 布局/组件/枚举与 Node 版 `ui.js`/`enums.js` 一致；`style.css` 与 Node 版逐字节相同
+- Node 版的 AI 依赖操作（50问/知识库整理/内容创作/三道审核/监测/报告）移植为**确定性模板引擎**（mock.rs），零外部依赖、结果可复现，配置 LLM Key 的真实化改造预留了 settings 配置项
+- 密码哈希改为 scrypt（与 Node 版 `crypto.scryptSync` 兼容），Rust 版可直接接管 Node 版数据库中的既有账号
+- 表单提交统一为「POST → 同步处理 → 303 重定向」（修复了 Node 版异步 job 返回裸 JSON 的遗留问题）；发布 mock 结算在页面访问时 catch-up（确认后 4 秒自动完成）
+- 演示种子数据与 Node 版一致（demo@geo.local / demo1234）
+- 注意事项 1-5 均已遵守（UTF-8 截断用 char_indices/chars、Mutex 恢复、esc 转义、Axum 0.8 `{pid}` 路由、CSS/JS 内联）
+
 ## 当前 Rust 版已有基础
 
 ```

@@ -1,76 +1,107 @@
-# 运维手册
+# 运维手册（Rust 版）
 
 > 读者：运维 / 值班人员。部署步骤见 `DEPLOYMENT.md`；本文覆盖上线后的日常运维、备份恢复与故障处理（Runbook）。
+> 所有命令假设已通过 `ops/install.sh` 安装（服务名 `geo-rust`，安装目录 `/opt/geo-rust`，端口 3438）；不同配置请 `source ops/geo.env` 或设置对应环境变量。
 
 ## 1. 服务拓扑与关键路径
 
 ```
-浏览器 / AI 工具 → Nginx(443) → node server.js(3438) → SQLite(WAL) + data/uploads/
+浏览器 / AI 工具 → :3438 geo-platform(Rust/Axum) → SQLite(WAL) + data/uploads/
+                  （可选）Nginx(443) 反代在前
 ```
 
-健康探针：`GET /healthz` → `{"ok":true}`（进程存活即返回，不查库）。
-日志：systemd 部署下 `journalctl -u geo -f`；错误带 `[server]` / `[openapi]` / `[publish:settle]` 前缀。
+健康探针：`GET /healthz` → `{"ok":true}`（进程存活即返回）。
+日志：systemd 部署下 `journalctl -u geo-rust`；启动日志含 `[seed]` 与 `GEO Platform (Rust) started`。
 
-## 2. 日常巡检（建议每日）
+## 2. geo-ctl 命令参考
 
-| 项 | 命令/位置 | 正常标准 |
+统一入口：`/opt/geo-rust/ops/geo-ctl.sh <命令>`（下文简称 `geo-ctl`；可 `ln -s` 到 `/usr/local/bin/geo-ctl`）。
+
+| 命令 | 作用 | 示例输出要点 |
 |---|---|---|
-| 存活 | `curl -s http://127.0.0.1:3438/healthz` | ok:true |
-| 进程 | `systemctl status geo` | active (running)，无 Restart 风暴 |
-| 磁盘 | `df -h` + `du -sh /opt/geo/platform/data` | 使用 < 80%；uploads 增长符合预期 |
-| 备份 | 检查备份目录当日文件存在且非 0 字节 | 每日 1 份 |
-| 错误日志 | `journalctl -u geo --since today \| grep -c ERROR` | 无连续 ERROR |
-| 发布任务积压 | 平台「内容发布」页：状态「发布中」超过 1 分钟的条数 | mock 模式应为 0（4s 内结算）；持续积压见 Runbook R3 |
+| `geo-ctl status` | 服务状态（systemd / 本地进程）+ 端口监听 | active (running)、`*:3438 geo-platform` |
+| `geo-ctl start` / `stop` / `restart` | 服务启停 | — |
+| `geo-ctl logs [-f] [N]` | 查看日志（默认 100 行） | journalctl 或 geo.out.log |
+| `geo-ctl health` | 五项健康检查：服务 / healthz / 登录页 / 数据库 / 磁盘 | 全部 ✓ 时「健康检查通过」 |
+| `geo-ctl backup [目录]` | **在线备份**：sqlite3 backup API（WAL 一致，不停服）+ uploads 归档 + 轮转保留 14 份 | `geo-20261102-*.db` |
+| `geo-ctl restore <备份.db>` | 恢复（需输入 YES；自动停服→覆盖→起服→健康检查） | 恢复前自动留 `*.pre-restore-*` |
+| `geo-ctl version` | 二进制构建时间 / 端口 / 数据库路径 / healthz | — |
+| `geo-ctl demo-reset` | ⚠️ 清库重建演示数据（输入 RESET 确认；自动先备份） | — |
 
-## 3. 备份与恢复
+开发机上等价命令（读取 `ops/geo.env`）：`make status | health | backup | logs | restart`。
 
-- **备份对象**：`data/geo.db`（+`-wal`/`-shm`）与 `data/uploads/`。
-- **在线备份**（不停服）：`sqlite3 data/geo.db ".backup '/backup/geo-$(date +%F).db'"`
-- **恢复**：停服 → 替换库文件（删除 -wal/-shm）→ 还原 uploads → 启服 → `/healthz` + 登录冒烟。全步骤见 `DEPLOYMENT.md §5`。
-- **演练频率**：每季度一次完整恢复演练，记录 RTO（目标 < 10 分钟）。
+## 3. 日常巡检（建议每日）
 
-## 4. 故障处理 Runbook
-
-### R1 服务无响应 / 502
-1. `systemctl status geo`——挂了看 `journalctl -u geo -n 200` 尾部异常；
-2. 常见原因：磁盘满（uploads 爆量）→ 清理/扩容；Node 崩溃 → 看 panic 日志，`Restart=always` 会自动拉起；
-3. 恢复后冒烟：`/healthz` + 登录 + 打开任一项目页。
-
-### R2 数据库锁 / 写入报 SQLITE_BUSY
-SQLite WAL 下罕见；多为备份脚本直接拷贝 -wal 造成。规范：备份用 `.backup` 命令（§3）。若已发生：`systemctl stop geo` → 移除 -wal/-shm（确认已 checkpoint）→ 启动。
-
-### R3 发布任务长时间「发布中」
-1. 这是 mock 发布器：确认进程是否中途重启——重启时 `catchUpOnStartup` 会自动结算超时任务，等待 1 分钟刷新；
-2. 仍卡住：查 `publishTasks` 表该任务 status 与 `createdAt`，手动触发修复：
-   `node -e "import('./platform/src/services.js').then(m=>console.log(m.confirmPublishTask('<taskId>')))"`（仅限 status=1 卡住的旧任务）；
-3. 生产接真实渠道后此 Runbook 由渠道回调逻辑替代。
-
-### R4 监测任务「运行中」但无结果
-1. 检查任务 checkpoints：第 0 天检查点是否 status=1 未执行（创建时 runNow=false 的场景）→ 平台点「执行下个复测点」；
-2. 检查问题是否仍属于该项目（跨项目问题在创建时已被拒绝，历史数据除外）。
-
-### R5 学员反馈「密钥无效 / 设备不匹配」
-1. `AUTH_REQUIRED`：密钥被吊销或输错 → 网页重建密钥 → `geo auth login` 重新绑定；
-2. `DEVICE_MISMATCH`：换机器/重装系统 → 重建密钥重新绑定（密钥与设备一一对应是设计行为）；
-3. 项目不在列表：网页「Open Key → 编辑授权项目」勾选即可，立即生效。
-
-### R6 `PLAN_EXPIRED / PLAN_USED` 咨询
-设计行为：plan 30 分钟有效、只能执行一次。让学员重新 plan → 重新确认 → apply。
-
-### R7 登录会话频繁失效
-检查是否多实例部署共用同一库但 Cookie 域不一致；`SESSION_SECURE=1` 必须在 HTTPS 下使用（HTTP 下加 Secure 会导致 Cookie 不发送）。
-
-## 5. 监控建议（接现有告警体系）
-
-| 指标 | 采集方式 | 告警阈值 |
+| 项 | 命令 | 正常标准 |
 |---|---|---|
-| 存活 | HTTP 拨测 `/healthz` | 连续 3 次失败 |
-| 磁盘 | data/ 目录用量 | > 80% |
-| 错误速率 | journalctl ERROR 关键字 | > 10/小时 |
-| 备份新鲜度 | 备份文件 mtime | > 26 小时 |
+| 存活 | `geo-ctl health` | 五项全部 ✓ |
+| 进程 | `systemctl status geo-rust` | active (running)，无 Restart 风暴（`systemctl show geo-rust -p NRestarts` 应为个位数） |
+| 磁盘 | `df -h`（DB 与备份分区） | < 80% |
+| 备份 | `ls -lt /opt/geo-backup/geo-*.db \| head -3` | 当日 1 份且 > 4KB |
+| 错误日志 | `journalctl -u geo-rust --since today \| grep -ci error` | 0 或无连续增长 |
+| 内存 | `ps -o rss= -p $(pgrep -f geo-platform)` | 常态 < 100 MB（空载 ≈ 10 MB） |
 
-## 6. 变更管理
+**每日备份 cron**（安装后一次性配置）：
 
-- 升级流程与回滚见 `DEPLOYMENT.md §6/§8`；
-- 数据库结构变更为幂等建表，升级无需手工迁移；重大版本升级先在测试实例跑 `node scripts/e2e.mjs`；
-- 配置变更（环境变量）= 改 systemd unit → `daemon-reload` → `restart`，属于变更操作需记录。
+```bash
+sudo crontab -e
+# 每日 02:30 备份；每 5 分钟巡检告警（需配置 ops/alert.env 的 ALERT_WEBHOOK 才外发）
+30 2 * * * /opt/geo-rust/ops/backup.sh
+*/5 * * * * /opt/geo-rust/ops/monitor.sh
+```
+
+备份策略：每日 1 份全量 + 保留 14 天 + 审计日志自动清理 90 天；恢复演练每季度一次（目标 RTO < 10 分钟）。
+
+## 4. 备份与恢复
+
+```bash
+# 在线备份（不停服）
+geo-ctl backup                          # → /opt/geo-backup/geo-<时间戳>.db + uploads-<时间戳>.tgz
+# 恢复
+geo-ctl restore /opt/geo-backup/geo-20261102-023001.db
+# 手动校验备份可用性（只读打开并数关键表）
+python3 -c "import sqlite3;c=sqlite3.connect('file:/opt/geo-backup/geo-XXXX.db?mode=ro',uri=True);print(c.execute('SELECT COUNT(*) FROM projects').fetchone())"
+```
+
+注意：**不要用 `cp geo.db` 做备份** —— WAL 模式下主库文件可能落后于 `-wal`，会得到过期快照。统一走 `geo-ctl backup` / `ops/backup.sh`（sqlite3 backup API）。
+
+## 5. 故障排查 Runbook
+
+| 症状 | 排查 | 处理 |
+|---|---|---|
+| 页面打不开 / 连接拒绝 | `geo-ctl status`、`ss -tlnp \| grep 3438` | 服务未起 → `geo-ctl start`；端口被占 → 改 `PORT` 或杀占用进程 |
+| healthz 200 但页面 5xx | `geo-ctl logs 200` 找 panic | 重启 `geo-ctl restart`；复现则反馈开发（附日志片段） |
+| 登录报「邮箱或密码错误」 | 确认账号存在：`python3 -c "import sqlite3;c=sqlite3.connect('<DB>');print(c.execute('SELECT email,lockedUntil FROM users').fetchall())"` | 密码遗忘且唯一账号 → 用 scrypt 重置（见下）；连续失败 5 次锁定 → 清 `failedAttempts/lockedUntil` |
+| 登录后跳回登录页 | 浏览器 Cookie 被禁 / 域名变更 | 清 Cookie 重试；反代场景保持 Host 透传 |
+| 「数据库锁定」类错误 | `lsof <DB>` 看其他进程 | 备份脚本并发 → 错峰；异常残留连接 → 重启服务 |
+| 磁盘 ≥ 85% 告警 | `du -sh /opt/geo-rust/data/uploads /opt/geo-backup` | 清旧备份（脚本自动轮转 14 份）、归档 uploads |
+| 备份未生成 | `cat /opt/geo-backup/backup.log` | 多为 python3 缺失或 DB 路径变更；`geo-ctl version` 核对路径 |
+| 内存持续增长 | `ps -o rss= -p $(pgrep -f geo-platform)` | 正常峰值 < 100MB；异常增长 → 记录复现步骤并重启反馈 |
+
+**重置 demo 密码（应急，需服务器 root）**：
+
+```bash
+python3 - <<'PY'
+import sqlite3, hashlib, secrets
+DB = "/opt/geo/platform/data/geo.db"     # ← 改为实际 GEO_DB_PATH
+c = sqlite3.connect(DB, timeout=10)
+salt = secrets.token_hex(16)
+h = hashlib.scrypt(b"<新密码>", salt=salt.encode(), n=16384, r=8, p=1, dklen=32, maxmem=64*1024*1024).hex()
+c.execute("UPDATE users SET passwordHash=?, salt=?, failedAttempts=0, lockedUntil=NULL WHERE email=?", (h, salt, "demo@geo.local"))
+c.commit(); print("done")
+PY
+```
+
+**清库重建演示数据**：`geo-ctl demo-reset`（自动先备份）。
+
+## 6. 监控与告警
+
+- 探针接入：`GET /healthz`（存活）、`GET /login`（应用层 200）。
+- 巡检告警：`ops/monitor.sh`（crontab 每 5 分钟）检查 healthz / systemd / 磁盘 / 备份新鲜度，异常写 `/var/log/geo-alerts.log` 并推送 `ops/alert.env` 里的 `ALERT_WEBHOOK`（企微机器人格式）。
+- 关键指标参考：空载 RSS ≈ 10 MB；healthz P99 < 5ms（本机）；构建产物约 7 MB。
+
+## 7. 数据维护备忘
+
+- 审计日志：`backup.sh` 每次运行自动清理 90 天前的 `auditLog`。
+- 测试残留清理（对生产库执行写操作测试后）：按公司/项目级联删除 `projects → monitorResults/monitorCheckpoints/monitorTasks/auditRecords/publishTasks/publishAccounts/materials/articles/questions/kbDocuments/knowledgeBases/sourceAssets/reports`，再删 `projects`、`companies`；涉及套餐兑换需还原 `orgs` 的 `planCode/planExpiresAt/quotaMonitorMonthly`。
+- 版本确认：`geo-ctl version`（二进制构建时间应与最近一次升级时间一致）。

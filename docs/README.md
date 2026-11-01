@@ -1,8 +1,8 @@
 # GEO 营销平台 v1.6.0 — 项目文档索引
 
-> 交付日期：2026-10-31 ｜ 状态：**已交付，服务器在线运行中**
-> 线上地址：http://120.46.133.88:3438（Rust 版主服务）
-> 登录：demo@geo.local（密码已由管理员设置，请通过强制改密流程设置你自己的密码）
+> 交付日期：2026-10-31 ｜ 最后更新：2026-11-01 ｜ 状态：**已交付，服务器在线运行中**
+> 线上地址：http://120.46.133.88:3438（Rust 版主服务，Web UI 23 页完整版）
+> 登录：demo@geo.local / demo1234（登录后请立即修改密码）
 
 ## 项目演进时间线
 
@@ -24,21 +24,21 @@
 | v1.6 异步 | 1.6.0 | 全站异步加载 + 后台任务系统 |
 | v1.6.1 加固 | 1.6.1 | 安全修复 + LLM 重试 + 内存监控 + 文件清理 |
 | Rust 部署 | 1.6.0 | Rust 版切换为主服务，Node 版停止 |
+| Rust UI 重构 | 1.6.2 | 23 页 Web UI 完整版重写（布局引擎/mock 引擎/scrypt 兼容），88 项全量测试本地+生产零失败 |
+| 运维封装 | — | geo-ctl 运维命令 + install.sh 一键安装 + Makefile + 文档重写（内部开源就绪） |
 
 ## 当前架构
 
 ```
 线上（华为云 120.46.133.88）
-├── Rust 版（geo-rust.service）← 主服务，端口 3438，内存 5MB
-│   ├── 二进制: /opt/geo-rust/target/release/geo-platform (4.1MB)
-│   ├── 源码: /opt/geo-rust/src/ (main.rs, db.rs, auth.rs, api.rs, ops.rs, web.rs, pages.rs, pages2.rs)
-│   └── 数据库: /opt/geo/platform/data/geo.db（与 Node 版共享）
-├── Node.js 版（geo.service）← 已停止，保留作为开发参考
-│   ├── 代码: /opt/geo/platform/
-│   └── 启动: systemctl start geo
-├── 备份: /opt/geo-backup/（每日 02:30 自动备份）
-├── 监控: /opt/geo/ops/monitor.sh（每 5 分钟）
-└── cron: /etc/cron.d/geo
+├── Rust 版（geo-rust.service）← 主服务，端口 3438，Web UI 23 页完整版
+│   ├── 二进制: /opt/geo-rust/target/release/geo-platform（≈7MB，空载 RSS ≈10MB）
+│   ├── 源码: /opt/geo-rust/src/（web 布局引擎 + pages×3 + mock 引擎 + ui + auth + db + api + ops，共 11 模块）
+│   ├── 运维: /opt/geo-rust/ops/geo-ctl.sh（status/health/backup/restore/logs）
+│   └── 数据库: /opt/geo/platform/data/geo.db（与 Node 版共享，scrypt 兼容）
+├── Node.js 版（geo.service）← 已停止，保留作为参考实现（/opt/geo/platform/）
+├── 备份: /opt/geo-backup/（每日 02:30 ops/backup.sh，保留 14 份）
+└── 监控: ops/monitor.sh（每 5 分钟，healthz/磁盘/备份新鲜度）
 ```
 
 ## 文档索引
@@ -56,8 +56,11 @@
 ### 运维
 | 文档 | 内容 |
 |---|---|
-| [docs/DEPLOYMENT.md](DEPLOYMENT.md) | 部署手册（systemd/Nginx/HTTPS/备份/检查单） |
-| [docs/OPERATIONS.md](OPERATIONS.md) | 运维手册（巡检/Runbook/监控） |
+| [docs/DEPLOYMENT.md](DEPLOYMENT.md) | 部署手册（install.sh 一键安装/升级/回滚、环境变量、systemd、Nginx/HTTPS、安全清单） |
+| [docs/OPERATIONS.md](OPERATIONS.md) | 运维手册（geo-ctl 命令参考、巡检、备份恢复、故障排查 Runbook） |
+| [ops/geo-ctl.sh](../ops/geo-ctl.sh) | 统一运维命令（启停/健康/备份恢复/日志） |
+| [ops/install.sh](../ops/install.sh) | 一键安装与升级脚本 |
+| [Makefile](../Makefile) | 开发与部署快捷命令（build/run/test/deploy） |
 | [docs/SECURITY.md](SECURITY.md) | 安全说明（认证/授权/防护/威胁模型） |
 
 ### 用户
@@ -85,7 +88,7 @@
 | 能力 | 39 | **40** |
 | 页面 | 23 | **21** |
 | systemd | geo.service（已停止） | geo-rust.service（**active + enabled**） |
-| 测试 | 169 项全绿 | 10 API + 21 页面 + 单元测试 |
+| 测试 | 169 项全绿 | **88 项全量测试（本地+生产零失败）** + 19 项单元测试 |
 
 ## 待你操作的事项
 
@@ -97,21 +100,17 @@
 ## 快速操作备忘
 
 ```bash
-# 查看服务状态
+# 统一运维入口（详见 docs/OPERATIONS.md）
+/opt/geo-rust/ops/geo-ctl.sh status | health | backup | logs -f | restore <db> | version
+
+# 等价的底层命令
 systemctl status geo-rust
-
-# 查看日志
 journalctl -u geo-rust -f
-
-# 重启服务
 systemctl restart geo-rust
 
-# 备份
-/opt/geo/ops/backup.sh
+# 升级（服务器上拉最新代码后）
+sudo bash /opt/geo-rust/ops/install.sh --upgrade   # 或开发机 make deploy
 
-# 切换回 Node 版（如需 Web UI 完整功能）
-systemctl stop geo-rust && systemctl start geo
-
-# 切换回 Rust 版
-systemctl stop geo && systemctl start geo-rust
+# 开发机快捷命令
+make status | health | backup | logs | deploy DEPLOY_HOST=root@<IP> DEPLOY_KEY=~/.ssh/<key>
 ```

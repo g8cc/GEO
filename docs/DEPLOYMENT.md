@@ -1,187 +1,138 @@
-# 部署手册
+# 部署手册（Rust 版）
 
-> 适用版本：v1.0.0 ｜ 组件：GEO 平台（platform/）+ geo CLI（cli/）+ GEO Skills（skills/）
-> 环境要求：Linux / macOS，**Node.js ≥ 22.5**（推荐 24 LTS），无任何 npm 依赖、无 Python、无原生编译。
+> 适用版本：v1.6.0 ｜ 组件：geo-platform（Rust/Axum 单二进制）+ geo CLI + GEO Skills
+> 环境要求：Linux x86_64 / aarch64（CentOS 8+、Ubuntu 20.04+、Debian 11+）或 macOS；**Rust 工具链（rustup，1.75+）**；磁盘 ≥ 2GB（含构建缓存）。
+> 旧 Node.js 版部署方式（`platform/` + node server.js）已废弃，见文末附录。
 
 ## 1. 部署形态
 
 | 形态 | 说明 | 适用 |
 |---|---|---|
-| 单机演示 | `node server.js` 直接跑 | 培训、POC、内网演示 |
-| 单机生产 | systemd 守护 + Nginx 反代 + HTTPS | 中小团队商用（SQLite 单机） |
-| 集群扩展 | 前置负载均衡，DB 换 Postgres（见 §7） | 多并发商用（需开发排期） |
+| 单机生产（推荐） | `ops/install.sh` 一键安装 + systemd 守护 + SQLite(WAL) | 中小团队商用 / 内部开源 |
+| 单机演示 | `ops/install.sh --seed-demo 1` | 培训、POC、内网演示 |
+| Nginx + HTTPS | 单机生产之上加反代（`ops/nginx-geo.conf.example`） | 对外域名访问 |
+| 本地开发 | `make run`（cargo run） | 开发调试 |
 
-## 2. 配置的两种方式
+## 2. 一键安装
 
-1. **UI 配置（推荐）**：管理员登录 → 侧边栏「系统配置（真实化开关）」→ 分组填写/粘贴 Key → 保存即生效（无需重启），带连通测试按钮；配置存于数据库 `settings` 表，密钥脱敏显示。
-2. **环境变量**：下表全部可用环境变量设定（作为默认值；UI 保存的值会覆盖同名环境变量）。
+```bash
+git clone <仓库地址> && cd GEO
+sudo bash ops/install.sh
+```
 
-## 2.1 环境变量（全部可选项）
+脚本动作（幂等，可重复执行 = 升级）：
+1. 检查 Rust 工具链（缺省给出 rustup 安装命令）
+2. 停止旧服务 → **备份现有数据库**（python3 sqlite3 backup API，WAL 一致）
+3. 同步 `rust/` 源码到安装目录（默认 `/opt/geo-rust`），运维脚本随包就位
+4. `cargo build --release`
+5. 写入 systemd 服务（`geo-rust`）并设开机自启
+6. 启动 + 健康检查，输出访问地址与安全清单
+
+常用参数：
+
+```bash
+sudo bash ops/install.sh --port 8080                 # 自定义端口
+sudo bash ops/install.sh --db /data/geo/geo.db       # 自定义数据库路径
+sudo bash ops/install.sh --seed-demo 0 --disable-register 1   # 生产推荐
+sudo bash ops/install.sh --upgrade                   # 只重建+重启（跳过 systemd 变更）
+sudo bash ops/install.sh --skip-build --no-start     # 只同步源码不构建不启动
+```
+
+安装完成后：
+
+- 访问 `http://<服务器IP>:3438`，演示账号 `demo@geo.local / demo1234`（SEED_DEMO=1 时）
+- 运维命令 `/opt/geo-rust/ops/geo-ctl.sh`（见 `OPERATIONS.md`）
+
+## 3. 手动部署（不使用 install.sh）
+
+```bash
+# 1. 构建本地二进制，或直接在服务器上构建
+cd rust && cargo build --release
+# 2. 部署目录
+sudo mkdir -p /opt/geo-rust/data && sudo cp -a src migrations Cargo.toml Cargo.lock /opt/geo-rust/
+sudo cp -a target/release/geo-platform /opt/geo-rust/
+# 3. systemd 单元（/etc/systemd/system/geo-rust.service）
+[Unit]
+Description=GEO Platform (Rust)
+After=network.target
+[Service]
+Type=simple
+WorkingDirectory=/opt/geo-rust
+Environment=PORT=3438
+Environment=GEO_DB_PATH=/opt/geo/platform/data/geo.db
+Environment=SEED_DEMO=0
+Environment=DISABLE_REGISTER=1
+ExecStart=/opt/geo-rust/target/release/geo-platform
+Restart=always
+RestartSec=3
+[Install]
+WantedBy=multi-user.target
+# 4. 启动
+sudo systemctl daemon-reload && sudo systemctl enable --now geo-rust
+```
+
+## 4. 配置（环境变量，systemd `Environment=` 或本地进程环境）
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `PORT` | 3438 | 监听端口 |
-| `GEO_DB_PATH` | `platform/data/geo.db` | SQLite 数据库文件（WAL 模式） |
-| `SEED_DEMO` | 1 | `=0` 跳过演示数据种子（**生产必设为 0**） |
-| `DISABLE_REGISTER` | 0 | `=1` 关闭自助注册（**生产建议设为 1**，管理员建号） |
-| `SESSION_SECURE` | 0 | `=1` 会话 Cookie 加 `Secure` 标记（**HTTPS 部署必设为 1**） |
-| `GEO_MOCK_FAST` | 1 | 发布 mock 结算 4 秒；`=0` 20 秒 |
-| `GEO_MOCK_FAIL_RATE` | 0 | 发布失败注入率（演练用，生产保持 0） |
-| `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` | 未设 | 配置后内容生成切真实 LLM（OpenAI 兼容协议），未配置走模板 |
-| `MONITOR_ARK_KEY` / `MONITOR_DEEPSEEK_KEY` / `MONITOR_HUNYUAN_KEY` / `MONITOR_DASHSCOPE_KEY`（各含 `_*_BASE/_*_MODEL`） | 未设 | 四平台真实 AI 监测；配谁谁真，未配回落演示数据 |
-| `MONITOR_MOCK` | 1 | `=0` 严格模式：未配置真实监测的平台显式报错，不给演示数据（**生产建议 =0**） |
-| `IMAGE_API_KEY` / `IMAGE_BASE_URL` / `IMAGE_MODEL` / `IMAGE_PROVIDER` | 未设 | 真实封面生成（OpenAI 兼容 images 或 `IMAGE_PROVIDER=dashscope` 万相）；未配置回落 SVG |
-| `S3_ENDPOINT` / `S3_BUCKET` / `S3_ACCESS_KEY` / `S3_SECRET_KEY` / `S3_REGION` / `S3_PUBLIC_BASE` | 未设 | 对象存储（OBS/OSS/MinIO，S3 兼容 SigV4）；未配置回落本地 uploads |
-| `PUBLISH_MODE` | manual | `manual`=真实流程（人工/回填/Webhook）；`mock`=演示自动结算（**生产保持 manual**） |
-| `PUBLISH_WEBHOOK_URL` / `PUBLISH_WEBHOOK_TOKEN` | 未设 | Webhook 发布渠道：确认发布后推送发布包，回包 `{ok,publishedUrl}` 自动落库 |
-| `TRUST_PROXY` | 0 | `=1` 部署在反代后信任 X-Forwarded-For（登录限流按真实客户端 IP） |
+| `GEO_DB_PATH` | `data/geo.db`（相对 WorkingDirectory） | SQLite 数据库（WAL 模式，自动迁移建表） |
+| `GEO_UPLOADS` | `data/uploads` | 封面/素材上传目录 |
+| `SEED_DEMO` | 1 | `=0` 跳过演示数据种子（**生产必设 0**；空库 + SEED_DEMO=1 会创建 demo@geo.local/demo1234） |
+| `DISABLE_REGISTER` | 0 | `=1` 关闭自助注册（**生产建议 1**，账号由管理员邀请/创建） |
+| `PUBLISH_MODE` | manual | `manual`=人工发布+回填（真实语义）；`mock`=确认后约 4 秒自动结算（仅演示培训） |
 
-## 3. 标准部署步骤（Linux 单机生产）
+服务集成（LLM / 监测四平台 / 图像 / 对象存储 / 发布 Webhook）通过管理员界面「系统设置 → 服务集成」配置，存于数据库 `settings` 表，密钥脱敏显示。当前 Rust 版内容生成与监测为**确定性模板引擎**，真实 Provider 接入为二期（语义参考 `platform/src/providers/`，见 `docs/REAL-INTEGRATION.md`）。
+
+## 5. 升级与回滚
+
+**升级（两条等价路径）**：
 
 ```bash
-# 1. 准备（Node 22.5+；Ubuntu 可用 nodesource 安装 22/24 LTS）
-node --version
+# 路径 A：服务器上重跑安装脚本（拉最新代码后）
+git pull && sudo bash ops/install.sh
 
-# 2. 放置代码
-mkdir -p /opt/geo && cd /opt/geo
-#    将项目文件同步到 /opt/geo（git clone 或安装包解压）
-
-# 3. 首次启动（生成空库；SEED_DEMO=0 不含演示账号）
-cd /opt/geo/platform
-SEED_DEMO=0 DISABLE_REGISTER=1 PORT=3438 node server.js
-#    用首个管理员流程建号：临时放开注册或使用下述 CLI 方式创建（见 §3.1）
-
-# 4. 数据目录（默认自动创建）
-#    /opt/geo/platform/data/geo.db      业务数据库
-#    /opt/geo/platform/data/uploads/    素材文件
-#    建议将 data/ 纳入备份与磁盘监控
+# 路径 B：开发机一键远程部署
+make deploy DEPLOY_HOST=root@<IP> DEPLOY_KEY=~/.ssh/<key>
+# 流程：打包源码 → scp → 服务器备份旧二进制 → 重建 → systemctl restart → healthz 验证
 ```
 
-### 3.1 创建首个管理员（注册关闭时）
+升级自动完成数据库备份（`/opt/geo-backup/pre-install-*.db`）；数据库迁移使用 `CREATE TABLE IF NOT EXISTS`，向后兼容。
 
-方式 A（推荐）：临时放开注册 → 注册后立刻改回：
-```bash
-DISABLE_REGISTER=0 PORT=3438 node server.js   # 浏览器 /register 创建管理员
-# 然后 Ctrl+C，改回 DISABLE_REGISTER=1 重启
-```
-
-方式 B：直接初始化（sqlite3 CLI 不可用时可用 node 脚本调用 `hashPassword` 写 users 表）。
-
-### 3.2 systemd 守护
-
-`/etc/systemd/system/geo.service`：
-
-```ini
-[Unit]
-Description=GEO Platform
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=/opt/geo/platform
-Environment=PORT=3438
-Environment=SEED_DEMO=0
-Environment=DISABLE_REGISTER=1
-Environment=SESSION_SECURE=1
-ExecStart=/usr/bin/node server.js
-Restart=always
-RestartSec=3
-User=geo
-# 硬化
-NoNewPrivileges=true
-ProtectSystem=strict
-ReadWritePaths=/opt/geo/platform/data
-PrivateTmp=true
-
-[Install]
-WantedBy=multi-user.target
-```
+**回滚**：
 
 ```bash
-sudo useradd -r -s /usr/sbin/nologin geo && sudo chown -R geo:geo /opt/geo
-sudo systemctl daemon-reload && sudo systemctl enable --now geo
-curl -s http://127.0.0.1:3438/healthz   # {"ok":true,...}
+sudo systemctl stop geo-rust
+cp /opt/geo-rust/geo-platform.bak-<时间戳> /opt/geo-rust/target/release/geo-platform
+# 如需连数据一起回滚：
+sudo cp /opt/geo-backup/pre-install-<时间戳>.db /opt/geo/platform/data/geo.db
+sudo systemctl start geo-rust && /opt/geo-rust/ops/geo-ctl.sh health
 ```
 
-### 3.3 Nginx 反向代理 + HTTPS
+## 6. Nginx 反代 + HTTPS
 
-```nginx
-server {
-    listen 443 ssl http2;
-    server_name geo.example.com;
-    ssl_certificate     /etc/letsencrypt/live/geo.example.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/geo.example.com/privkey.pem;
+模板见 `ops/nginx-geo.conf.example`：域名解析 → certbot 签证书 → 替换 `server_name` 与证书路径 → `cp` 到 `/etc/nginx/conf.d/geo.conf` → `nginx -t && systemctl reload nginx`。
+启用 HTTPS 后建议在 systemd 单元追加 `Environment=DISABLE_REGISTER=1`（如未关）并确认登录 Cookie 策略符合内网/外网要求。
 
-    client_max_body_size 25m;          # 素材上传（服务端上限 20MB）
-    location / {
-        proxy_pass http://127.0.0.1:3438;
-        proxy_set_header Host $host;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto https;
-    }
-}
-server { listen 80; server_name geo.example.com; return 301 https://$host$request_uri; }
-```
+## 7. 安全清单（上线前逐项打勾）
 
-> HTTPS 部署后务必 `SESSION_SECURE=1`（Cookie Secure 标记），Open API 同域走 `https://geo.example.com/api/open/v1/...`。
+- [ ] 修改演示密码 `demo@geo.local / demo1234`（登录 → 修改密码）
+- [ ] `SEED_DEMO=0`、`DISABLE_REGISTER=1`（install.sh 参数或 systemd 单元）
+- [ ] 防火墙仅放行必要端口（3438 或 443）
+- [ ] HTTPS 部署（对外域名场景）
+- [ ] 每日备份 cron 已配置（`ops/backup.sh`，见 OPERATIONS.md §3）
+- [ ] 监控告警接入（`ops/monitor.sh` + 企微机器人 webhook，可选）
 
-## 4. CLI 与 Skills 部署（学员/运营机器）
+## 8. 数据归属与迁移
+
+- 数据库默认建议与旧版共存路径 `/opt/geo/platform/data/geo.db`——Rust 版密码哈希（scrypt）与 Node 版完全兼容，**直接指向既有库即可接管全部账号与业务数据**。
+- 全新部署（空库）时，首次启动自动建表；`SEED_DEMO=1` 会写入演示公司与项目。
+- 迁移到其他机器：`geo-ctl backup` → 拷贝备份文件 → 新机 `geo-ctl restore`。
+
+## 附录：旧 Node.js 版部署（已废弃，仅供追溯）
 
 ```bash
-# CLI（二选一）
-cd /opt/geo/cli && npm install -g .
-alias geo='node /opt/geo/cli/geo.js'
-
-# 登录（本机设备绑定；密钥在平台「系统设置 → Open Key」创建）
-geo auth login --server https://geo.example.com
-
-# Skills 安装到 AI 编程工具（预演 → 执行）
-node /opt/geo/install.js            # 预演
-node /opt/geo/install.js --apply    # 安装 ~/.codex/skills 与 ~/.claude/skills
+cd platform && node server.js        # 需 Node ≥ 22.5，端口 3438
 ```
 
-学员安装提示词（文档原文中的平台地址替换为实际地址）：
-`请从 <你的 skills 仓库地址> 安装最新 GEO Skills：…在系统设置 → Open Key 创建接口密钥：<平台地址>/#/settings/keys…`
-
-## 5. 备份与恢复
-
-```bash
-# 备份（WAL 模式下请连 -wal/-shm 一起拷贝，或用 sqlite3 在线备份）
-sqlite3 /opt/geo/platform/data/geo.db ".backup '/backup/geo-$(date +%F).db'"
-tar czf /backup/uploads-$(date +%F).tgz /opt/geo/platform/data/uploads
-
-# 恢复（停服 → 替换 → 启服）
-systemctl stop geo
-cp /backup/geo-2026-10-31.db /opt/geo/platform/data/geo.db
-rm -f /opt/geo/platform/data/geo.db-wal /opt/geo/platform/data/geo.db-shm
-tar xzf /backup/uploads-*.tgz -C /
-systemctl start geo
-```
-
-建议：每日定时备份 + 保留 30 天 + 每季度做一次恢复演练；`data/` 所在磁盘空间告警阈值 80%。
-
-## 6. 升级
-
-1. 备份（§5）；
-2. 替换代码（git pull / 新安装包），`node --check server.js` 校验；
-3. 重启——库结构迁移为幂等 `CREATE TABLE IF NOT EXISTS`，自动补建；
-4. 冒烟：`/healthz`、登录、任一项目页、`node scripts/e2e.mjs`（测试环境预演后再上生产）；
-5. Skills/CLI 升级：`node install.js --apply`（自动备份旧技能到 `~/.geo-skills-backups/`）+ `geo version --check`。
-
-## 7. 生产化检查单（上线前逐项打勾）
-
-- [ ] `SEED_DEMO=0`（无演示账号/演示数据）
-- [ ] `DISABLE_REGISTER=1`（关闭自助注册）+ 管理员账号强密码
-- [ ] HTTPS 启用且 `SESSION_SECURE=1`
-- [ ] Nginx 限流（至少对 `/login`、`/register`、`/api/open/v1/auth/verify`）
-- [ ] systemd 硬化（非 root 用户、ProtectSystem、ReadWritePaths 仅 data/）
-- [ ] 备份定时任务 + 恢复演练通过
-- [ ] 磁盘监控（data/ 目录）+ `/healthz` 拨测
-- [ ] 日志收集（journalctl / 文件）与保留策略
-- [ ] 已知边界确认（docs/AUDIT.md §3：同步 SQLite 规模、auth/verify 限流建议）
-- [ ] 真实能力配置：管理员登录 →「系统配置」页填写 LLM/监测四平台/图像/S3（或用环境变量，见 docs/REAL-INTEGRATION.md）；`MONITOR_MOCK=0`（严格模式）、`PUBLISH_MODE=manual`（默认）
-- [ ] 反代后设置 `TRUST_PROXY=1`
-
-## 8. 故障回滚
-
-`systemctl stop geo` → 恢复上一版本代码目录 → 恢复最近备份（§5）→ 启动 → 冒烟。数据库结构向前兼容（幂等建表），回滚旧版本代码无需回滚库。
+Node 版的运维文档历史版本见 git（`docs/DEPLOYMENT.md` @ v1.5 之前）。
