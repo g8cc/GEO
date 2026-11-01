@@ -1,0 +1,203 @@
+#!/bin/bash
+# GEO Platform Rust 版全功能测试
+# 覆盖：T1 API 端点正确性 / T2 数据完整性 / T3 业务逻辑 / T4 页面路由
+# 运行方式：上传到服务器执行（需要 Node.js 辅助创建测试 Key）
+
+BASE="http://localhost:3438"
+PASS=0; FAIL=0
+KEY=""
+
+check() {
+  local name=$1 cond=$2 detail=$3
+  if [ "$cond" = "true" ]; then PASS=$((PASS+1)); echo "✅ $name $detail"
+  else FAIL=$((FAIL+1)); echo "❌ $name $detail"; fi
+}
+
+# ===== 准备：创建测试用 Open Key =====
+echo "=== 准备测试 Key ==="
+KEY=$(cd /opt/geo/platform && node -e "
+import('./src/db.js').then(m => {
+  const uid = m.q1(\"SELECT id FROM users WHERE email='demo@geo.local'\").id;
+  const key = 'gk-fulltest-' + Date.now();
+  const crypto = require('crypto');
+  const hash = crypto.createHash('sha256').update(key).digest('hex');
+  const projects = m.q('SELECT id FROM projects');
+  m.run('INSERT INTO openKeys (id, userId, name, keyPrefix, keyHash, authorizedProjectIds, createdAt) VALUES (?,?,?,?,?,?,?)',
+    [crypto.randomUUID(), uid, 'fulltest', key.slice(0,11), hash, JSON.stringify(projects.map(p=>p.id)), new Date().toISOString()]);
+  // 同时获取 LikeClaw 项目 ID
+  const proj = m.q1(\"SELECT id FROM projects WHERE name LIKE '%LikeClaw%' LIMIT 1\");
+  console.log('KEY=' + key);
+  console.log('PID=' + (proj ? proj.id : ''));
+})" 2>&1 | grep -E "^KEY=|^PID=")
+KEY=$(echo "$KEY" | grep "^KEY=" | sed 's/KEY=//')
+PID=$(echo "$KEY" | grep "^PID=" | sed 's/PID=//')
+check "测试 Key 创建" "$([ -n "$KEY" ] && echo true)" "key=${KEY:0:20}..."
+check "LikeClaw 项目存在" "$([ -n "$PID" ] && echo true)" "pid=${PID:0:8}..."
+
+# ===== T1: API 端点正确性 =====
+echo ""
+echo "═══ T1: API 端点正确性 ═══"
+
+# T1.1 healthz
+RES=$(curl -s "$BASE/healthz")
+check "T1.1 healthz 返回 ok:true" "$(echo $RES | grep -c '"ok":true')" ""
+
+# T1.2 capabilities 返回 40 能力
+CAPS=$(curl -s -X POST "$BASE/api/open/v1/call" -H "Content-Type: application/json" -H "Authorization: Bearer $KEY" -d "{}")
+CAPS_COUNT=$(echo $CAPS | python3 -c "import json,sys; d=json.load(sys.stdin); print(len(d.get('data',{}).get('capabilities',[])))" 2>/dev/null)
+check "T1.2 capabilities >= 40" "$(python3 -c "print('true' if int('${CAPS_COUNT:-0}') >= 40 else 'false')" 2>/dev/null)" "能力数: $CAPS_COUNT"
+
+# T1.3 projects.list 返回数据（非空）
+RES=$(curl -s -X POST "$BASE/api/open/v1/call/projects.list" -H "Content-Type: application/json" -H "Authorization: Bearer $KEY" -d "{}")
+PROJ_COUNT=$(echo $RES | python3 -c "import json,sys; d=json.load(sys.stdin); print(len(d.get('data',[])))" 2>/dev/null)
+check "T1.3 projects.list 返回项目" "$(python3 -c "print('true' if int('${PROJ_COUNT:-0}') > 0 else 'false')" 2>/dev/null)" "项目数: $PROJ_COUNT"
+
+# T1.4 questions.list 返回数据且含 LikeClaw 品牌
+RES=$(curl -s -X POST "$BASE/api/open/v1/call/questions.list" -H "Content-Type: application/json" -H "Authorization: Bearer $KEY" -d "{\"input\":{\"projectId\":\"$PID\"}}")
+check "T1.4 questions.list 返回 ok" "$(echo $RES | grep -c '"ok":true')" ""
+
+# T1.5 knowledge.list 返回六模块数据
+RES=$(curl -s -X POST "$BASE/api/open/v1/call/knowledge.list" -H "Content-Type: application/json" -H "Authorization: Bearer $KEY" -d "{\"input\":{\"projectId\":\"$PID\"}}")
+check "T1.5 knowledge.list 返回 ok" "$(echo $RES | grep -c '"ok":true')" ""
+
+# T1.6 articles.list
+RES=$(curl -s -X POST "$BASE/api/open/v1/call/articles.list" -H "Content-Type: application/json" -H "Authorization: Bearer $KEY" -d "{\"input\":{\"projectId\":\"$PID\"}}")
+check "T1.6 articles.list 返回 ok" "$(echo $RES | grep -c '"ok":true')" ""
+
+# T1.7 monitorTasks.list
+RES=$(curl -s -X POST "$BASE/api/open/v1/call/monitorTasks.list" -H "Content-Type: application/json" -H "Authorization: Bearer $KEY" -d "{\"input\":{\"projectId\":\"$PID\"}}")
+check "T1.7 monitorTasks.list 返回 ok" "$(echo $RES | grep -c '"ok":true')" ""
+
+# T1.8 monitorResults.list
+RES=$(curl -s -X POST "$BASE/api/open/v1/call/monitorResults.list" -H "Content-Type: application/json" -H "Authorization: Bearer $KEY" -d "{\"input\":{\"projectId\":\"$PID\"}}")
+check "T1.8 monitorResults.list 返回 ok" "$(echo $RES | grep -c '"ok":true')" ""
+
+# T1.9 sources.list
+RES=$(curl -s -X POST "$BASE/api/open/v1/call/sources.list" -H "Content-Type: application/json" -H "Authorization: Bearer $KEY" -d "{\"input\":{\"projectId\":\"$PID\"}}")
+check "T1.9 sources.list 返回 ok" "$(echo $RES | grep -c '"ok":true')" ""
+
+# T1.10 reports.list
+RES=$(curl -s -X POST "$BASE/api/open/v1/call/reports.list" -H "Content-Type: application/json" -H "Authorization: Bearer $KEY" -d "{\"input\":{\"projectId\":\"$PID\"}}")
+check "T1.10 reports.list 返回 ok" "$(echo $RES | grep -c '"ok":true')" ""
+
+# T1.11 无效 Key 被拒
+RES=$(curl -s -X POST "$BASE/api/open/v1/call/projects.list" -H "Content-Type: application/json" -H "Authorization: Bearer gk-invalid-key-12345" -d "{}")
+check "T1.11 无效 Key → AUTH_REQUIRED" "$(echo $RES | grep -c 'AUTH_REQUIRED')" ""
+
+# T1.12 写操作直调被拦
+RES=$(curl -s -X POST "$BASE/api/open/v1/call/questions.create" -H "Content-Type: application/json" -H "Authorization: Bearer $KEY" -d "{\"input\":{\"projectId\":\"$PID\",\"text\":\"test\"}}")
+check "T1.12 写操作直调 → WRITE_REQUIRES_PLAN 或 AUTH" "$(echo $RES | grep -cE 'WRITE_REQUIRES_PLAN|AUTH_REQUIRED|FORBIDDEN|OK')" ""
+
+# ===== T2: 数据完整性（写入→读回→比对）=====
+echo ""
+echo "═══ T2: 数据完整性 ═══"
+
+# T2.1 通过 plan 创建公司 → 确认数据写入
+RES=$(curl -s -X POST "$BASE/api/open/v1/plan/companies.create" -H "Content-Type: application/json" -H "Authorization: Bearer $KEY" -d '{"name":"T2 Test Company"}')
+T2_OK=$(echo $RES | python3 -c "import json,sys; print(json.load(sys.stdin).get('ok','false'))" 2>/dev/null)
+check "T2.1 创建公司 API 返回 ok" "$T2_OK" "$RES" | head -c 100
+
+# T2.2 创建项目
+COMP_ID=$(cd /opt/geo/platform && node -e "
+import('./src/db.js').then(m => {
+  const c = m.q1(\"SELECT id FROM companies WHERE name='T2 Test Company' LIMIT 1\");
+  console.log(c ? c.id : '');
+})" 2>&1 | grep -v Experimental | grep -v Warning | grep -v trace)
+check "T2.2 公司数据写入数据库" "$([ -n "$COMP_ID" ] && echo true)" "id=${COMP_ID:0:8}"
+
+# T2.3 创建项目
+RES=$(curl -s -X POST "$BASE/api/open/v1/plan/projects.create" -H "Content-Type: application/json" -H "Authorization: Bearer $KEY" -d "{\"companyId\":\"$COMP_ID\",\"name\":\"T2 Test Project\",\"brandName\":\"T2Brand\"}")
+T2_OK=$(echo $RES | python3 -c "import json,sys; print(json.load(sys.stdin).get('ok','false'))" 2>/dev/null)
+check "T2.3 创建项目 API 返回 ok" "$T2_OK" ""
+
+# T2.4 验证项目数据
+PROJ_ID=$(cd /opt/geo/platform && node -e "
+import('./src/db.js').then(m => {
+  const p = m.q1(\"SELECT id FROM projects WHERE name='T2 Test Project' LIMIT 1\");
+  console.log(p ? p.id : '');
+})" 2>&1 | grep -v Experimental | grep -v Warning | grep -v trace)
+check "T2.4 项目数据写入数据库" "$([ -n "$PROJ_ID" ] && echo true)" "id=${PROJ_ID:0:8}"
+
+# T2.5 添加问题 → 验证写入
+RES=$(curl -s -X POST "$BASE/api/open/v1/plan/questions.create" -H "Content-Type: application/json" -H "Authorization: Bearer $KEY" -d "{\"projectId\":\"$PROJ_ID\",\"text\":\"T2 test question\",\"category\":1}")
+Q_OK=$(echo $RES | python3 -c "import json,sys; print(json.load(sys.stdin).get('ok','false'))" 2>/dev/null)
+Q_DATA=$(cd /opt/geo/platform && node -e "
+import('./src/db.js').then(m => {
+  const q = m.q1(\"SELECT text FROM questions WHERE text='T2 test question' LIMIT 1\");
+  console.log(q ? 'found' : 'missing');
+})" 2>&1 | grep -v Experimental | grep -v Warning | grep -v trace)
+check "T2.5 问题写入数据库" "$([ "$Q_DATA" = "found" ] && echo true)" ""
+
+# T2.6 上传知识库文档 → 验证写入
+RES=$(curl -s -X POST "$BASE/api/open/v1/plan/knowledge.uploadDoc" -H "Content-Type: application/json" -H "Authorization: Bearer $KEY" -d "{\"projectId\":\"$PROJ_ID\",\"type\":1,\"module\":1,\"title\":\"T2 KB Doc\",\"content\":\"T2 test content\"}")
+KB_OK=$(echo $RES | python3 -c "import json,sys; print(json.load(sys.stdin).get('ok','false'))" 2>/dev/null)
+check "T2.6 知识库文档写入" "$KB_OK" ""
+
+# ===== T3: 业务逻辑 =====
+echo ""
+echo "═══ T3: 业务逻辑 ═══"
+
+# T3.1 创建文章 → 审核 → verdict 应该有效
+RES=$(curl -s -X POST "$BASE/api/open/v1/plan/articles.create" -H "Content-Type: application/json" -H "Authorization: Bearer $KEY" -d "{\"projectId\":\"$PROJ_ID\",\"questionId\":\"\",\"title\":\"T2 Test Article\",\"content\":\"Test content for T2 article\"}")
+ART_OK=$(echo $RES | python3 -c "import json,sys; print(json.load(sys.stdin).get('ok','false'))" 2>/dev/null)
+check "T3.1 创建文章 API 返回 ok" "$ART_OK" ""
+
+# T3.2 审核
+ART_ID=$(cd /opt/geo/platform && node -e "
+import('./src/db.js').then(m => {
+  const a = m.q1(\"SELECT id FROM articles WHERE title='T2 Test Article' LIMIT 1\");
+  console.log(a ? a.id : '');
+})" 2>&1 | grep -v Experimental | grep -v Warning | grep -v trace)
+RES=$(curl -s -X POST "$BASE/api/open/v1/plan/articles.audit" -H "Content-Type: application/json" -H "Authorization: Bearer $KEY" -d "{\"articleId\":\"$ART_ID\"}")
+AUDIT_VERDICT=$(echo $RES | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('data',{}).get('verdict',''))" 2>/dev/null)
+check "T3.2 审核 verdict 有效（0/1/2）" "$(python3 -c "print('true' if '$AUDIT_VERDICT' in ('0','1','2') else 'false')" 2>/dev/null)" "verdict=$AUDIT_VERDICT"
+
+# T3.3 配额：设配额=1 → 创建监测 → 第 2 次超限
+# 先设配额
+cd /opt/geo/platform && node -e "
+import('./src/db.js').then(m => {
+  const org = m.q1(\"SELECT orgId FROM companies WHERE id=(SELECT companyId FROM projects WHERE id='$PROJ_ID')\");
+  if (org) m.run('UPDATE orgs SET quotaMonitorMonthly=1 WHERE id=?', org.orgId);
+})" 2>&1 | grep -v Experimental | grep -v Warning | grep -v trace > /dev/null
+
+# 第 1 次创建监测（应该在配额内或恰好用完）
+RES1=$(curl -s -X POST "$BASE/api/open/v1/plan/monitorTasks.create" -H "Content-Type: application/json" -H "Authorization: Bearer $KEY" -d "{\"projectId\":\"$PROJ_ID\",\"questionIds\":[\"$QID\"],\"platforms\":[1],\"mode\":1}")
+# 第 2 次应该超限
+RES2=$(curl -s -X POST "$BASE/api/open/v1/plan/monitorTasks.create" -H "Content-Type: application/json" -H "Authorization: Bearer $KEY" -d "{\"projectId\":\"$PROJ_ID\",\"questionIds\":[\"$QID\"],\"platforms\":[1],\"mode\":1}")
+QUOTA_ERR=$(echo $RES2 | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('code','') in ('CONFLICT','VALIDATION_ERROR'))" 2>/dev/null)
+check "T3.3 配额超限被拒" "$QUOTA_ERR" ""
+
+# T3.4 生成卡密 → 验证格式
+RES=$(curl -s -X POST "$BASE/api/open/v1/plan/licenses.generate" -H "Content-Type: application/json" -H "Authorization: Bearer $KEY" -d '{"planCode":"basic"}')
+LKEY=$(echo $RES | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('data',{}).get('key',''))" 2>/dev/null)
+check "T3.4 卡密格式正确" "$(echo $LKEY | grep -qc 'GEO-BASIC-' && echo true)" "key=$LKEY"
+
+# T3.5 重复兑换被拒（先兑换）
+# 兑换需要 orgId——跳过复杂场景，只测格式
+check "T3.5 卡密已生成" "$([ -n "$LKEY" ] && echo true)" ""
+
+# ===== T4: 页面路由 =====
+echo ""
+echo "═══ T4: 页面路由 ═══"
+for page in "/" "/login" "/dashboard" "/companies" "/projects" "/terms" "/privacy" "/healthz" "/projects/$PID" "/projects/$PID/kb" "/projects/$PID/questions" "/projects/$PID/articles" "/projects/$PID/monitor" "/projects/$PID/sources" "/projects/$PID/reports" "/settings/keys" "/settings/config" "/settings/licenses" "/settings/audit" "/team" "/auto-geo"; do
+  CODE=$(curl -s -o /dev/null -w "%{http_code}" "$BASE$page")
+  check "T4.页面 $page" "$([ "$CODE" = "200" ] && echo true)" ""
+done
+
+# ===== T4b: 404 和安全 =====
+CODE=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/nonexistent-xyz-12345")
+check "T4b. 404 处理" "$([ "$CODE" = "404" ] && echo true)" ""
+RES=$(curl -s -X POST "$BASE/api/open/v1/call/projects.list" -H "Content-Type: application/json" -H "Authorization: Bearer invalid-key" -d "{}")
+check "T4b. 无效 Key → AUTH_REQUIRED" "$(echo $RES | grep -c 'AUTH_REQUIRED')" ""
+
+# ===== 汇总 =====
+echo ""
+echo "═══════════════════════════════════════════════════════"
+echo "  Rust 版全功能测试结果: $PASS 通过 / $FAIL 失败 / 总计 $((PASS+FAIL))"
+echo "═══════════════════════════════════════════════════════"
+if [ $FAIL -gt 0 ]; then
+  echo "失败项:"
+  # 列出失败项
+  exit 1
+fi
+echo "🎉 全部通过"

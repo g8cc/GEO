@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: 静态检查（clippy -D warnings）
+        working-directory: rust
+        run: cargo clippy --release -- -D warnings
+      - name: 单元测试
+        working-directory: rust
+        run: cargo test --release --quiet
+      - name: 构建
+        working-directory: rust
+        run: cargo build --release
+      - name: 全量测试（含页面完整性守卫）
+        working-directory: rust
+        env:
+          PORT: "3439"
+        run: |
+          ./target/release/geo-platform &
+          for i in $(seq 1 20); do sleep 1; curl -s -m 1 http://localhost:3439/healthz | grep -q ok && break; done
+          cd .. && bash scripts/rust-full-test.sh http://localhost:3439
+      - name: HTML 标签平衡审计
+        working-directory: rust
+        run: |
+          cd .. && python3 scripts/rust-html-audit.py http://localhost:3439
