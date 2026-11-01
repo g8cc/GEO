@@ -20,7 +20,7 @@ pub fn with_db<F, T>(f: F) -> T
 where F: FnOnce(&Connection) -> T
 {
     let mutex = DB.get().expect("db not initialized");
-    let mut guard = mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let guard = mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     f(&guard)
 }
 
@@ -45,10 +45,15 @@ mod tests {
 
     #[test]
     fn test_wal_mode() {
-        let conn = Connection::open_in_memory().unwrap();
+        // WAL 仅支持文件库（内存库固定为 memory 模式），用临时文件验证
+        let tmp = std::env::temp_dir().join(format!("geo-wal-test-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        let conn = Connection::open(&tmp).unwrap();
         conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
         let mode: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
         assert_eq!(mode, "wal");
+        drop(conn);
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 

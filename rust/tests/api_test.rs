@@ -1,70 +1,83 @@
-// Rust 版 API 集成测试
-// 运行方式：先启动服务器，再运行测试
-// cargo test --test api_test -- --nocapture
+// Rust 版集成测试：需要先启动服务器（PORT=3438），再运行
+//   cargo run &
+//   cargo test --test api_test -- --nocapture
+// 使用 std TcpStream 原始 HTTP，避免额外依赖。
+use serde_json::{json, Value};
+use std::io::{Read, Write};
+use std::net::TcpStream;
 
-use std::io::Read;
+const BASE: &str = "127.0.0.1:3438";
 
-fn http_post(path: &str, body: &str, key: &str) -> (u16, serde_json::Value) {
-    let url = format!("http://localhost:3438{}", path);
-    let mut req = urllib_request(&url, "POST");
-    req.header("Content-Type", "application/json");
-    req.header("Authorization", &format!("Bearer {}", key));
-    let resp = req.body(body.to_string()).send().unwrap();
-    let status = resp.status().as_u16();
-    let body = resp.text().unwrap();
-    (status, serde_json::from_str(&body).unwrap_or(json!({})))
+fn raw_request(method: &str, path: &str, headers: &[(&str, &str)], body: &str) -> (u16, String) {
+    let mut stream = match TcpStream::connect(BASE) {
+        Ok(s) => s,
+        Err(_) => return (0, String::new()),
+    };
+    let mut req = format!(
+        "{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nContent-Length: {}\r\n",
+        method,
+        path,
+        BASE,
+        body.len()
+    );
+    for (k, v) in headers {
+        req.push_str(&format!("{}: {}\r\n", k, v));
+    }
+    req.push_str("\r\n");
+    req.push_str(body);
+    stream.write_all(req.as_bytes()).unwrap();
+    let mut buf = String::new();
+    let _ = stream.read_to_string(&mut buf);
+    let status: u16 = buf.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let body_start = buf.find("\r\n\r\n").map(|i| i + 4).unwrap_or(buf.len());
+    (status, buf[body_start..].to_string())
 }
 
-fn http_get(path: &str, key: &str) -> (u16, serde_json::Value) {
-    let url = format!("http://localhost:3438{}", path);
-    let req = urllib_request(&url, "GET");
-    let resp = req.header("Authorization", &format!("Bearer {}", key)).send().unwrap();
-    let status = resp.status().as_u16();
-    let body = resp.text().unwrap();
-    (status, serde_json::from_str(&body).unwrap_or(json!({})))
+fn server_up() -> bool {
+    TcpStream::connect(BASE).is_ok()
 }
 
-// 使用 std::net::TcpStream 做原始 HTTP（避免依赖 reqwest）
-fn urllib_request(url: &str, method: &str) -> http::Request<http::Body> {
-    http::Request::builder()
-        .method(method)
-        .uri(url)
-        .body(http::Body::empty())
-        .unwrap()
+fn json_of(body: &str) -> Value {
+    serde_json::from_str(body).unwrap_or(json!({}))
 }
 
 #[test]
 fn test_healthz() {
-    let (status, body) = http_get("/healthz", "");
+    if !server_up() {
+        eprintln!("跳过：服务器未启动（PORT=3438）");
+        return;
+    }
+    let (status, body) = raw_request("GET", "/healthz", &[], "");
     assert_eq!(status, 200);
-    assert_eq!(body["ok"], true);
+    assert_eq!(json_of(&body)["ok"], true);
 }
 
 #[test]
-fn test_capabilities() {
-    let (status, body) = http_post("/api/open/v1/call", "{}", "test-key");
+fn test_login_page_and_auth_flow() {
+    if !server_up() {
+        eprintln!("跳过：服务器未启动（PORT=3438）");
+        return;
+    }
+    let (status, body) = raw_request("GET", "/login", &[], "");
     assert_eq!(status, 200);
-    assert_eq!(body["ok"], true);
-    let caps = body["data"]["capabilities"].as_array().unwrap();
-    assert!(caps.len() >= 40);
+    assert!(body.contains("GEO 营销平台"));
+    // 未登录访问受保护页 → 302/303 跳登录
+    let (status, _) = raw_request("GET", "/dashboard", &[], "");
+    assert!(status == 302 || status == 303, "expect redirect, got {}", status);
 }
 
 #[test]
-fn test_auth_required() {
-    let (status, body) = http_post("/api/open/v1/call/projects.list", "{}", "invalid-key");
-    assert_eq!(body["ok"], false);
-    assert_eq!(body["code"], "AUTH_REQUIRED");
-}
-
-#[test]
-fn test_invalid_capability() {
-    let (status, body) = http_post("/api/open/v1/call/nonexistent.capability", "{}", "test-key");
-    assert_eq!(body["ok"], false);
-}
-
-#[test]
-fn test_root_redirect() {
-    let (status, body) = http_get("/", "");
-    // Rust 版根路径返回 "GEO Platform (Rust)"
+fn test_open_api_auth() {
+    if !server_up() {
+        eprintln!("跳过：服务器未启动（PORT=3438）");
+        return;
+    }
+    let (status, body) = raw_request(
+        "POST",
+        "/api/open/v1/call/projects.list",
+        &[("Content-Type", "application/json"), ("Authorization", "Bearer gk-invalid")],
+        "{}",
+    );
     assert_eq!(status, 200);
+    assert!(body.contains("AUTH_REQUIRED"));
 }

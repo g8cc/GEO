@@ -21,16 +21,6 @@ pub fn auth_key(headers: &HeaderMap) -> Result<String, (StatusCode, Json<Value>)
     uid.map_err(|_| err("AUTH_REQUIRED", "密钥无效"))
 }
 
-fn check_project(headers: &HeaderMap, pid: &str) -> Result<String, (StatusCode, Json<Value>)> {
-    let uid = auth_key(headers)?;
-    db::with_db(|c| {
-        c.query_row(
-            "SELECT 1 FROM projects p JOIN companies c ON p.companyId=c.id JOIN orgMembers om ON om.orgId=c.orgId AND om.userId=? WHERE p.id=?",
-            [&uid, pid], |r| r.get::<_, i32>(0)
-        ).map(|_| uid.clone())
-    }).map_err(|_| err("FORBIDDEN", "无权限"))
-}
-
 fn query_list(sql: &str, pid: &str, cols: &[&str]) -> Vec<Value> {
     db::with_db(|c| {
         let mut stmt = match c.prepare(sql) { Ok(s) => s, Err(_) => return vec![] };
@@ -47,7 +37,6 @@ fn query_list(sql: &str, pid: &str, cols: &[&str]) -> Vec<Value> {
 }
 
 // ===== handlers =====
-pub async fn root() -> &'static str { "GEO Platform (Rust)" }
 pub async fn healthz() -> Json<Value> { Json(json!({"ok": true})) }
 pub async fn capabilities() -> Json<Value> {
     let caps = ["projects.list","projects.create","projects.update","questions.list","questions.create",

@@ -28,7 +28,7 @@ pub async fn create_company(h: HeaderMap, body: String) -> ApiResult {
     if name.is_empty() { return Err(err("VALIDATION_ERROR", "公司名称必填")); }
     let id = gen_id();
     let org_id = gen_id();
-    let email = format!("owner@{}", name.replace(" ", "").to_lowercase());
+    let _email = format!("owner@{}", name.replace(" ", "").to_lowercase());
     db::with_db(|c| {
         c.execute("INSERT INTO orgs (id, name, ownerUserId, quotaMonitorMonthly, createdAt) VALUES (?,?,?,0,?)",
             rusqlite::params![org_id, format!("{} 的团队", name), user_id, now()]).ok();
@@ -42,7 +42,7 @@ pub async fn create_company(h: HeaderMap, body: String) -> ApiResult {
 
 // ===== 创建项目 =====
 pub async fn create_project(h: HeaderMap, body: String) -> ApiResult {
-    let user_id = auth_uid(&h)?;
+    let _user_id = auth_uid(&h)?;
     let input: Value = serde_json::from_str(&body).unwrap_or(json!({}));
     let company_id = input["companyId"].as_str().unwrap_or("").to_string();
     let name = input["name"].as_str().unwrap_or("").to_string();
@@ -66,7 +66,7 @@ pub async fn create_project(h: HeaderMap, body: String) -> ApiResult {
 
 // ===== 添加问题 =====
 pub async fn create_question(h: HeaderMap, body: String) -> ApiResult {
-    let user_id = auth_uid(&h)?;
+    let _user_id = auth_uid(&h)?;
     let input: Value = serde_json::from_str(&body).unwrap_or(json!({}));
     let pid = input["projectId"].as_str().unwrap_or("").to_string();
     let text = input["text"].as_str().unwrap_or("").to_string();
@@ -87,7 +87,7 @@ pub async fn create_question(h: HeaderMap, body: String) -> ApiResult {
 
 // ===== 上传知识库文档 =====
 pub async fn upload_kb_doc(h: HeaderMap, body: String) -> ApiResult {
-    let user_id = auth_uid(&h)?;
+    let _user_id = auth_uid(&h)?;
     let input: Value = serde_json::from_str(&body).unwrap_or(json!({}));
     let pid = input["projectId"].as_str().unwrap_or("").to_string();
     let title = input["title"].as_str().unwrap_or("").to_string();
@@ -109,7 +109,7 @@ pub async fn upload_kb_doc(h: HeaderMap, body: String) -> ApiResult {
 
 // ===== 创建文章 =====
 pub async fn create_article(h: HeaderMap, body: String) -> ApiResult {
-    let user_id = auth_uid(&h)?;
+    let _user_id = auth_uid(&h)?;
     let input: Value = serde_json::from_str(&body).unwrap_or(json!({}));
     let pid = input["projectId"].as_str().unwrap_or("").to_string();
     let qid = input["questionId"].as_str().unwrap_or("").to_string();
@@ -126,7 +126,7 @@ pub async fn create_article(h: HeaderMap, body: String) -> ApiResult {
 
 // ===== 三道审核 =====
 pub async fn audit_article(h: HeaderMap, body: String) -> ApiResult {
-    let user_id = auth_uid(&h)?;
+    let _user_id = auth_uid(&h)?;
     let input: Value = serde_json::from_str(&body).unwrap_or(json!({}));
     let aid = input["articleId"].as_str().unwrap_or("").to_string();
     let id = gen_id();
@@ -140,7 +140,7 @@ pub async fn audit_article(h: HeaderMap, body: String) -> ApiResult {
 
 // ===== 创建监测任务 =====
 pub async fn create_monitor(h: HeaderMap, body: String) -> ApiResult {
-    let user_id = auth_uid(&h)?;
+    let _user_id = auth_uid(&h)?;
     let input: Value = serde_json::from_str(&body).unwrap_or(json!({}));
     let pid = input["projectId"].as_str().unwrap_or("").to_string();
     let qids = input["questionIds"].as_array().map(|a| a.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect::<Vec<_>>()).unwrap_or_default();
@@ -157,7 +157,7 @@ pub async fn create_monitor(h: HeaderMap, body: String) -> ApiResult {
 
 // ===== 生成卡密 =====
 pub async fn generate_license(h: HeaderMap, body: String) -> ApiResult {
-    let user_id = auth_uid(&h)?;
+    let _user_id = auth_uid(&h)?;
     let input: Value = serde_json::from_str(&body).unwrap_or(json!({}));
     let plan = input["planCode"].as_str().unwrap_or("basic").to_string();
     let key = format!("GEO-{}-{}-{}-{}",
@@ -186,7 +186,10 @@ mod tests {
     fn test_create_company() {
         setup_test_db();
         let uid = auth::gen_uuid();
-        let result = db::with_db(|c| {
+        db::with_db(|c| {
+            // orgMembers.userId 外键引用 users(id)，先建用户
+            c.execute("INSERT INTO users (id, email, passwordHash, salt, role, createdAt) VALUES (?,?,?,?,?,?)",
+                rusqlite::params![uid, format!("{}@test.local", uid), "h", "s", "member", auth::now_iso()]).unwrap();
             let org_id = auth::gen_uuid();
             c.execute("INSERT INTO orgs (id, name, ownerUserId, createdAt) VALUES (?,?,?,?)",
                 rusqlite::params![org_id, "Test Org", uid, auth::now_iso()]).unwrap();
