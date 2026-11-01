@@ -1,0 +1,17 @@
+node_modules/
+target/
+__pycache__/
+*.db
+*.db-wal
+*.db-shm
+*.log
+.env
+.venv/
+.DS_Store
+reference-geo-skills/
+course-materials/
+likeclaw-profile.txt
+platform/data/
+*.pem
+*.key
+*.tar.gz

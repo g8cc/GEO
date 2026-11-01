@@ -1,0 +1,12 @@
+{
+  "name": "geo-cli",
+  "version": "1.6.0",
+  "description": "geo CLI —— GEO 平台命令行工具（Skills 与平台之间的桥接层，零依赖）",
+  "type": "module",
+  "bin": {
+    "geo": "./geo.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

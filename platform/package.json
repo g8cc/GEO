@@ -1,0 +1,14 @@
+{
+  "name": "geo-platform",
+  "version": "1.6.0",
+  "description": "GEO 营销平台（Web + Open API + Mock Providers），零外部依赖，Node 24+ 原生实现",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "seed:reset": "node -e \"import('./src/db.js').then(m=>{m.resetDemo();console.log('demo data reset')})\""
+  },
+  "engines": {
+    "node": ">=22.5"
+  }
+}
