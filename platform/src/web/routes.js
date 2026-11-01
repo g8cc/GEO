@@ -17,19 +17,51 @@ function route(method, pattern, handler) {
 }
 
 // ============ 认证 ============
+// 登录 / 注册共用分屏品牌版式（与 Rust 版 rust/src/web.rs auth_shell 逐字节同源）
+function authShell(h2, intro, errHtml, formInner, foot, action = '/login') {
+  return `<style>main.main{max-width:100%;padding:0}</style>
+<div class="auth-wrap">
+  <div class="auth-brand">
+    <div class="auth-logo">G</div>
+    <h1>GEO 营销平台</h1>
+    <p class="auth-tag">让 AI 在用户提问时，准确认识你、推荐你、引用你。</p>
+    <ul class="auth-points">
+      <li><b>存事实</b>知识库六模块沉淀品牌事实，AI 只用已确认的事实写作，绝不编造</li>
+      <li><b>做内容</b>答案卡 / 品牌文章 / 产品文章，三道审核后按平台规范发布</li>
+      <li><b>看结果</b>上榜监测告诉你「AI 引用了你没有」，沉淀信源，逐轮优化</li>
+    </ul>
+    <div class="auth-foot">GEO Platform v1.6 ｜ 用户协议 · 隐私政策</div>
+  </div>
+  <div class="auth-panel">
+    <form method="post" class="auth-card" action="${action}">
+      <h2>${e(h2)}</h2>
+      <p class="kv" style="margin:0 0 10px">${intro}</p>
+      ${errHtml}
+      ${formInner}
+      <p class="kv" style="margin-top:14px">${foot}</p>
+    </form>
+  </div>
+</div>`;
+}
+
+const PWD_EYE = (id) => `<button type="button" class="pwd-eye" onclick="var p=document.getElementById('${id}');p.type=p.type==='password'?'text':'password';this.textContent=p.type==='password'?'显示':'隐藏'">显示</button>`;
+
 route('GET', /^\/login$/, async (req, res, c) => {
-  c.body = card('', `
-    <div class="auth-hero">
-      <h1 style="margin:0 0 6px">GEO 营销平台</h1>
-      <p class="kv">Skills 负责让 AI 帮你执行，GEO 平台负责保存项目、执行发布、监测结果和沉淀数据。</p>
-      ${c.query.error ? `<p style="color:var(--bad)">${e(c.query.error)}</p>` : ''}
-      <form method="post" action="/login">
-        <label class="f">邮箱</label><input type="email" name="email" required value="demo@geo.local">
-        <label class="f">密码</label><input type="password" name="password" required value="" placeholder="请输入密码">
-        <div style="margin-top:14px"><button class="btn" style="width:100%">登录</button></div>
-      </form>
-      <p class="kv" style="margin-top:12px">没有账号？<a href="/register">注册</a> · 演示账号已预填<br><a href="/terms" target="_blank">用户协议</a> · <a href="/privacy" target="_blank">隐私政策</a></p>
-    </div>`);
+  const errHtml = c.query.error ? `<div class="auth-error">${e(c.query.error)}</div>` : '';
+  c.body = authShell(
+    '登录',
+    'Skills 负责让 AI 帮你执行，平台负责保存项目、执行发布、监测结果和沉淀数据。',
+    errHtml,
+    `
+        <label class="f">邮箱</label><input type="email" name="email" required value="demo@geo.local" autocomplete="username">
+        <label class="f">密码</label>
+        <div class="pwd-row">
+          <input type="password" name="password" id="geo-pwd" required placeholder="请输入密码" autocomplete="current-password" autofocus>
+          ${PWD_EYE('geo-pwd')}
+        </div>
+        <div style="margin-top:16px"><button class="btn" style="width:100%">登录</button></div>`,
+    '没有账号？<a href="/register">注册</a> · 演示账号已预填<br><a href="/terms" target="_blank">用户协议</a> · <a href="/privacy" target="_blank">隐私政策</a>',
+  );
   c.render('登录');
 });
 
@@ -113,19 +145,23 @@ route('GET', /^\/register$/, async (req, res, c) => {
     res.writeHead(302, { Location: '/login?error=' + encodeURIComponent('注册已关闭，请联系管理员开通账号') });
     return res.end();
   }
-  c.body = card('', `
-    <div class="auth-hero">
-      <h1 style="margin:0 0 6px">注册 GEO 平台</h1>
-      ${c.query.error ? `<p style="color:var(--bad)">${e(c.query.error)}</p>` : ''}
-      ${c.query.error ? `<p style="color:var(--bad)">${e(c.query.error)}</p>` : ''}
-      <form method="post" action="/register">
-        <label class="f">邮箱</label><input type="email" name="email" required>
-        <label class="f">密码（至少 8 位，须含字母和数字）</label><input type="password" name="password" required minlength="8">
+  const errHtml = c.query.error ? `<div class="auth-error">${e(c.query.error)}</div>` : '';
+  c.body = authShell(
+    '注册 GEO 平台',
+    '注册后即可创建公司、知识库与 GEO 项目，开始你的第一次 GEO 优化闭环。',
+    errHtml,
+    `
+        <label class="f">邮箱</label><input type="email" name="email" required autocomplete="username" autofocus>
+        <label class="f">密码（至少 8 位，须含字母和数字）</label>
+        <div class="pwd-row">
+          <input type="password" name="password" id="geo-pwd" required minlength="8" autocomplete="new-password">
+          ${PWD_EYE('geo-pwd')}
+        </div>
         <label class="f" style="font-weight:400"><input type="checkbox" name="agree" value="1" required style="width:auto"> 我已阅读并同意 <a href="/terms" target="_blank">《用户协议》</a> 与 <a href="/privacy" target="_blank">《隐私政策》</a></label>
-        <div style="margin-top:14px"><button class="btn" style="width:100%">创建账号</button></div>
-      </form>
-      <p class="kv" style="margin-top:12px">已有账号？<a href="/login">登录</a></p>
-    </div>`);
+        <div style="margin-top:14px"><button class="btn" style="width:100%">创建账号</button></div>`,
+    '已有账号？<a href="/login">直接登录</a>',
+    '/register',
+  );
   c.render('注册');
 });
 
