@@ -162,9 +162,9 @@ pub async fn generate_license(h: HeaderMap, body: String) -> ApiResult {
     let plan = input["planCode"].as_str().unwrap_or("basic").to_string();
     let key = format!("GEO-{}-{}-{}-{}",
         plan.to_uppercase(),
-        &auth::sha256(&format!("{}{}", gen_id(), now()))[0..4].to_uppercase(),
-        &auth::sha256(&format!("{}{}", gen_id(), now()))[4..8].to_uppercase(),
-        &auth::sha256(&format!("{}{}", gen_id(), now()))[8..12].to_uppercase());
+        auth::sha256(&format!("{}{}", gen_id(), now()))[0..4].to_uppercase(),
+        auth::sha256(&format!("{}{}", gen_id(), now()))[4..8].to_uppercase(),
+        auth::sha256(&format!("{}{}", gen_id(), now()))[8..12].to_uppercase());
     db::with_db(|c| {
         c.execute("INSERT INTO licenseKeys (key, planCode, status, createdAt) VALUES (?,?,?,?)",
             rusqlite::params![key, plan, "unused", now()]).ok();

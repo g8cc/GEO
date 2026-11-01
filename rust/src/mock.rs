@@ -1649,7 +1649,7 @@ pub fn create_report(
                 "# 品牌诊断报告 —— {brand}\n\n**诊断样本：** {total} 次监测（同题多平台/多批次）\n**品牌出现：** {mentioned}/{total}（{pct}%）\n**精确收录（正式链接被引用）：** {exact}/{total}\n**描述不准确：** {inaccurate} 次\n\n## 竞品占位\n| 竞品 | 出现次数 |\n|---|---|\n{comp_rows}\n\n## 最重要的病根\n{root}\n\n## 下一步点对点优化建议\n- 补什么证据：{ev}\n- 创作什么内容：答案型品牌文章 + AI 答案卡（结论先行、含证据链接）\n- 发布到哪里：按监测结果的引用来源分布，优先已出现我方 URL 的平台\n- 用哪个原问题复测：固定主攻问题原文，第 3/7/14 天复测",
                 total = total,
                 mentioned = mentioned,
-                pct = if total > 0 { mentioned * 100 / total } else { 0 },
+                pct = (mentioned * 100).checked_div(total).unwrap_or(0),
                 exact = exact,
                 inaccurate = inaccurate,
                 comp_rows = if comp_rows.is_empty() { "| （无） | 0 |".to_string() } else { comp_rows.join("\n") },
@@ -2076,7 +2076,7 @@ pub fn auto_geo(conn: &Connection, user_id: &str, raw: &str) -> Result<AutoGeoRe
         }
     }
     let mut kw: Vec<(String, usize)> = freq.into_iter().collect();
-    kw.sort_by(|a, b| b.1.cmp(&a.1));
+    kw.sort_by_key(|(_, v)| std::cmp::Reverse(*v));
     let keywords = kw.iter().take(3).map(|(k, _)| k.clone()).collect::<Vec<_>>().join(",");
     let selling_points = "详见知识库六模块（自动整理）";
 

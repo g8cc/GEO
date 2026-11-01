@@ -1017,7 +1017,7 @@ pub async fn sites(headers: HeaderMap, Path(pid): Path<String>) -> Response {
         }
         #[allow(clippy::type_complexity)]
         let mut list: Vec<(&String, &(usize, usize, Vec<String>))> = sites.iter().collect();
-        list.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+        list.sort_by_key(|item| std::cmp::Reverse(item.1 .0));
         let rows: Vec<String> = list
             .iter()
             .map(|(domain, (count, own, titles))| {
