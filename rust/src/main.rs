@@ -134,6 +134,7 @@ async fn main() {
         // 一键 GEO
         .route("/auto-geo", get(pages3::auto_geo_page))
         .route("/auto-geo/run", post(pages3::auto_geo_run))
+        .layer(axum::middleware::from_fn(web::write_guard))
         .layer(CompressionLayer::new());
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();

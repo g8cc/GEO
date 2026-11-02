@@ -2,6 +2,21 @@
 
 本项目的所有重要变更记录在此文件。格式参考 Keep a Changelog。
 
+## [1.6.3] - 2026-11-03
+
+### Added
+- **事件通知真实推送**：`monitor.done` / `publish.done` 经 org Webhook 推送（10s 超时、事件过滤、后台线程不阻塞请求）；本地 TCP 监听器真实 HTTP 链路测试 4 项
+- **viewer 只读守卫**：axum 中间件单点拦截只读成员的全部 POST（仅放行登出），对齐 Node 版角色守卫；注册语义对齐（不再自动建组织，否则 viewer 永不触发）——全量测试新增 T5 角色守卫 4 项
+- **SESSION_SECURE=1**：会话 Cookie Secure 标记（HTTPS 部署）
+- **质量门自动化**：`make verify` 单命令五道防线（clippy -D warnings / 单测 / 全量 93 项 / HTML 标签平衡审计 27 页 / 渲染级截图 14 页）；pre-commit 钩子与 GitHub Actions CI（浮动 stable，已全绿）
+- **结构性出口收口**：`pub_page`/`user_page` 统一页面壳、`redirect_q` 统一跳转编码，杜绝缺壳与双重编码类事故
+
+### Fixed
+- **登录锁定失效**（Rust 版锁 0 秒）→ 15 分钟 + 剩余分钟数提示
+- **登录失败提示双重编码**（Node/Rust 四处）→ redirect_q 收口
+- **Node 版注册页 error 双重渲染**（历史遗留）
+- **ops 脚本五连修**（全新安装实测发现）：geo.env 配置发现机制、bash 3.2 多字节变量名吞噬（全量花括号化）、本地模式 GEO_DB_PATH 丢失、set -e 下 kill 失败中断安装、geo.pid 写入安装器自身 PID（改为 lsof 反查监听进程）
+
 ## [1.6.2] - 2026-11-01
 
 ### Added

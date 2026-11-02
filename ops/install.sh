@@ -53,7 +53,7 @@ done
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SRC_RUST="$REPO_ROOT/rust"
 
-[ -f "$SRC_RUST/Cargo.toml" ] || { err "找不到源码：$SRC_RUST（请在仓库目录内执行）"; exit 1; }
+[ -f "$SRC_RUST/Cargo.toml" ] || { err "找不到源码：${SRC_RUST}（请在仓库目录内执行）"; exit 1; }
 
 # ---------- 1. 前置检查 ----------
 info "检查构建环境…"
@@ -69,10 +69,16 @@ command -v systemctl >/dev/null 2>&1 && [ -d /etc/systemd/system ] && USE_SYSTEM
 
 # ---------- 2. 停止旧服务（升级场景）----------
 if [ "$USE_SYSTEMD" = "1" ] && systemctl list-unit-files "$GEO_SERVICE.service" &>/dev/null && [ -f "/etc/systemd/system/$GEO_SERVICE.service" ]; then
-  info "停止现有服务 $GEO_SERVICE…"
+  info "停止现有服务 ${GEO_SERVICE}…"
   systemctl stop "$GEO_SERVICE" 2>/dev/null || true
 fi
+# 停止本地模式旧进程：pid 文件 + 二进制路径兜底 + 等待端口释放（set -e 下 kill 失败不中断）
 if [ -f "$GEO_DIR/geo.pid" ]; then kill "$(cat "$GEO_DIR/geo.pid")" 2>/dev/null || true; rm -f "$GEO_DIR/geo.pid"; fi
+pkill -f "$GEO_DIR/target/release/geo-platform" 2>/dev/null || true
+for _ in $(seq 1 10); do
+  lsof -iTCP:"$GEO_PORT" -sTCP:LISTEN >/dev/null 2>&1 || break
+  sleep 0.5
+done
 
 # ---------- 3. 备份现有数据库（升级保护）----------
 if [ -f "$GEO_DB" ] && command -v python3 >/dev/null 2>&1; then
@@ -96,6 +102,7 @@ cp -a "$SRC_RUST/src" "$SRC_RUST/migrations" "$GEO_DIR/"
 # 运维脚本随包安装
 mkdir -p "$GEO_DIR/ops"
 cp -a "$REPO_ROOT/ops/"*.sh "$REPO_ROOT/ops/geo.env.example" "$GEO_DIR/ops/" 2>/dev/null || true
+chmod +x "$GEO_DIR/ops/"*.sh 2>/dev/null || true
 ok "源码同步完成（$(ls "$GEO_DIR/src" | wc -l | tr -d ' ') 个源文件）"
 
 # ---------- 5. 构建 ----------
@@ -107,9 +114,21 @@ else
   warn "跳过构建（--skip-build）"
 fi
 
+# ---------- 5b. 写入 ops/geo.env（geo-ctl 的运行时配置来源）----------
+mkdir -p "$GEO_DIR/ops"
+cat > "$GEO_DIR/ops/geo.env" <<GEOENVEOF
+GEO_SERVICE=$GEO_SERVICE
+GEO_DIR=$GEO_DIR
+GEO_PORT=$GEO_PORT
+GEO_DB=$GEO_DB
+GEO_UPLOADS=$GEO_DIR/data/uploads
+GEO_BACKUP_DIR=/opt/geo-backup
+GEOENVEOF
+ok "配置已写入 $GEO_DIR/ops/geo.env"
+
 # ---------- 6. systemd 服务 ----------
 if [ "$USE_SYSTEMD" = "1" ] && [ "$UPGRADE_ONLY" != "1" ]; then
-  info "写入 systemd 服务 $GEO_SERVICE…"
+  info "写入 systemd 服务 ${GEO_SERVICE}…"
   cat > "/etc/systemd/system/$GEO_SERVICE.service" <<EOF
 [Unit]
 Description=GEO Platform (Rust)
@@ -138,7 +157,13 @@ fi
 if [ "$DO_START" = "1" ]; then
   info "启动服务…"
   if [ "$USE_SYSTEMD" = "1" ]; then systemctl restart "$GEO_SERVICE"; else
-    (cd "$GEO_DIR" && PORT="$GEO_PORT" nohup "$GEO_DIR/target/release/geo-platform" >> "$GEO_DIR/geo.out.log" 2>&1 & echo $! > "$GEO_DIR/geo.pid")
+    (cd "$GEO_DIR" && PORT="$GEO_PORT" GEO_DB_PATH="$GEO_DB" nohup "$GEO_DIR/target/release/geo-platform" >> "$GEO_DIR/geo.out.log" 2>&1 &)
+    sleep 1
+    for _ in $(seq 1 20); do
+      lsof -iTCP:"$GEO_PORT" -sTCP:LISTEN -P -t 2>/dev/null | head -1 > "$GEO_DIR/geo.pid" || true
+      [ -s "$GEO_DIR/geo.pid" ] && break
+      sleep 0.5
+    done
   fi
   for i in $(seq 1 15); do
     sleep 1

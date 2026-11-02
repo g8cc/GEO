@@ -1,7 +1,7 @@
 #!/bin/bash
 # geo-ctl —— GEO 营销平台（Rust 版）统一运维命令
 # 覆盖：服务启停 / 状态 / 日志 / 健康检查 / 数据库备份恢复 / 版本信息
-# 兼容两种运行模式：systemd（生产，服务名 $GEO_SERVICE）与本地直接进程（开发）
+# 兼容两种运行模式：systemd（生产，服务名 ${GEO_SERVICE}）与本地直接进程（开发）
 #
 # 用法：geo-ctl <命令>
 #   start | stop | restart | status    服务管理
@@ -23,6 +23,10 @@
 #   GEO_KEEP      备份保留份数        默认 14
 
 set -uo pipefail
+
+# 自动加载安装时写入的配置（install.sh 生成 ops/geo.env，与二进制同目录分发）
+_HERE="$(cd "$(dirname "$0")" && pwd)"
+[ -f "${_HERE}/geo.env" ] && . "${_HERE}/geo.env"
 
 GEO_SERVICE="${GEO_SERVICE:-geo-rust}"
 GEO_DIR="${GEO_DIR:-/opt/geo-rust}"
@@ -55,17 +59,25 @@ GEO_UPLOADS="${GEO_UPLOADS:-$GEO_DIR/data/uploads}"
 
 # ---------- 服务管理 ----------
 svc_start() {
-  if have_systemd_unit; then systemctl start "$GEO_SERVICE" && ok "服务已启动（systemd: $GEO_SERVICE）"
+  if have_systemd_unit; then systemctl start "$GEO_SERVICE" && ok "服务已启动（systemd: ${GEO_SERVICE}）"
   else
     [ -f "$GEO_DIR/geo.pid" ] && kill -0 "$(cat "$GEO_DIR/geo.pid")" 2>/dev/null && { warn "已在运行"; return 0; }
-    (cd "$GEO_DIR" && PORT="$GEO_PORT" nohup "$BIN" >> "$GEO_DIR/geo.out.log" 2>&1 & echo $! > "$GEO_DIR/geo.pid")
+    (cd "$GEO_DIR" && PORT="$GEO_PORT" GEO_DB_PATH="$GEO_DB" nohup "$BIN" >> "$GEO_DIR/geo.out.log" 2>&1 &)
+    sleep 1
+    for _ in $(seq 1 20); do
+      lsof -iTCP:"$GEO_PORT" -sTCP:LISTEN -P -t 2>/dev/null | head -1 > "$GEO_DIR/geo.pid" || true
+      [ -s "$GEO_DIR/geo.pid" ] && break
+      sleep 0.5
+    done
     ok "服务已启动（本地模式，PID $(cat "$GEO_DIR/geo.pid")）"
   fi
 }
 svc_stop() {
   if have_systemd_unit; then systemctl stop "$GEO_SERVICE" && ok "服务已停止"
   else
-    if [ -f "$GEO_DIR/geo.pid" ]; then kill "$(cat "$GEO_DIR/geo.pid")" 2>/dev/null && rm -f "$GEO_DIR/geo.pid"; ok "服务已停止"; else warn "未在运行（无 PID 文件）"; fi
+    if [ -f "$GEO_DIR/geo.pid" ]; then kill "$(cat "$GEO_DIR/geo.pid")" 2>/dev/null || true; rm -f "$GEO_DIR/geo.pid"; fi
+    pkill -f "$GEO_DIR/target/release/geo-platform" 2>/dev/null || true
+    ok "服务已停止"
   fi
 }
 svc_status() {
@@ -75,7 +87,15 @@ svc_status() {
     if [ -f "$GEO_DIR/geo.pid" ] && kill -0 "$(cat "$GEO_DIR/geo.pid")" 2>/dev/null; then ok "运行中（PID $(cat "$GEO_DIR/geo.pid")）"; else err "未运行"; fi
   fi
   echo
-  info "端口 $GEO_PORT 监听：$(ss -tlnp 2>/dev/null | grep ":$GEO_PORT " | head -1 | grep -oE '\((\"[^\"]+\")' || echo '未监听')"
+  local portinfo="未监听"
+  if command -v ss >/dev/null 2>&1; then
+    portinfo=$(ss -tlnp 2>/dev/null | grep ":${GEO_PORT} " | head -1 || echo "")
+    [ -n "$portinfo" ] && portinfo=$(echo "$portinfo" | grep -oE '\(\\"[^"]+\\"' || echo "未监听")
+  elif command -v lsof >/dev/null 2>&1; then
+    portinfo=$(lsof -iTCP:"${GEO_PORT}" -sTCP:LISTEN -P 2>/dev/null | tail -1 | awk '{print $1 " (pid " $2 ")"}')
+    [ -z "$portinfo" ] && portinfo="未监听"
+  fi
+  info "端口 ${GEO_PORT} 监听：${portinfo}"
 }
 
 cmd_logs() {
@@ -91,7 +111,7 @@ cmd_health() {
   info "GEO 平台健康检查（$(date '+%F %T')）"
   # 1. 服务存活
   if have_systemd_unit; then
-    if systemctl is-active --quiet "$GEO_SERVICE"; then ok "服务 $GEO_SERVICE：active"; else err "服务 $GEO_SERVICE：$(systemctl is-active "$GEO_SERVICE")"; fail=1; fi
+    if systemctl is-active --quiet "$GEO_SERVICE"; then ok "服务 ${GEO_SERVICE}：active"; else err "服务 ${GEO_SERVICE}：$(systemctl is-active "$GEO_SERVICE")"; fail=1; fi
   fi
   # 2. healthz
   local hz; hz=$(curl -s -m 5 "http://127.0.0.1:$GEO_PORT/healthz" 2>/dev/null)
@@ -102,7 +122,7 @@ cmd_health() {
   # 4. 数据库
   if [ -f "$GEO_DB" ]; then
     local users; users=$(python3 -c "import sqlite3;c=sqlite3.connect('file:$GEO_DB?mode=ro',uri=True);print(c.execute('SELECT COUNT(*) FROM users').fetchone()[0])" 2>/dev/null || echo "?")
-    ok "数据库：$GEO_DB（用户数 $users）"
+    ok "数据库：${GEO_DB}（用户数 ${users}）"
   else err "数据库不存在：$GEO_DB"; fail=1; fi
   # 5. 磁盘
   local usage; usage=$(df -P "$(dirname "$GEO_DB")" | tail -1 | awk '{print $5}' | tr -d '%')
@@ -148,7 +168,7 @@ cmd_restore() {
   local file="$1"
   [ -z "${file:-}" ] && { err "用法：geo-ctl restore <备份文件.db>"; return 1; }
   [ ! -f "$file" ] && { err "备份文件不存在：$file"; return 1; }
-  read -r -p "⚠️  将用 $file 覆盖 $GEO_DB，当前数据将被替换。输入 YES 确认: " a
+  read -r -p "⚠️  将用 $file 覆盖 ${GEO_DB}，当前数据将被替换。输入 YES 确认: " a
   [ "$a" = "YES" ] || { warn "已取消"; return 1; }
   info "停止服务…"; svc_stop; sleep 1
   cp "$GEO_DB" "$GEO_DB.pre-restore-$(date +%s)" 2>/dev/null || true
@@ -161,7 +181,7 @@ cmd_restore() {
 # ---------- 版本 / 演示数据 ----------
 cmd_version() {
   echo "GEO Platform（Rust 版）"
-  [ -f "$BIN" ] && echo "  二进制：$BIN（构建于 $(stat -c%y "$BIN" 2>/dev/null | cut -d. -f1)）"
+  [ -f "$BIN" ] && echo "  二进制：${BIN}（构建于 $(stat -c%y "$BIN" 2>/dev/null | cut -d. -f1)）"
   echo "  服务：$GEO_SERVICE @ 端口 $GEO_PORT"
   echo "  数据库：$GEO_DB"
   echo "  healthz：$(curl -s -m 3 "http://127.0.0.1:$GEO_PORT/healthz" 2>/dev/null || echo '无响应')"

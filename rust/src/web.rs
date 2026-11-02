@@ -90,7 +90,8 @@ pub fn new_session_cookie(user_id: &str) -> String {
         )
         .ok();
     });
-    format!("geo_session={}; HttpOnly; Path=/; SameSite=Lax; Max-Age={}", sid, 14 * 86400)
+    let secure = if std::env::var("SESSION_SECURE").as_deref() == Ok("1") { "; Secure" } else { "" };
+    format!("geo_session={}; HttpOnly; Path=/; SameSite=Lax; Max-Age={}{}", sid, 14 * 86400, secure)
 }
 
 pub fn logout_resp(sid: &str) -> Response {
@@ -808,22 +809,12 @@ pub async fn register_submit(headers: HeaderMap, fb: Fb) -> Response {
     let uid = auth::gen_uuid();
     let salt = auth::new_salt();
     let hash = auth::hash_password(&password, &salt);
+    // 与 Node 版对齐：注册只建账号不建组织（组织由首次使用/被邀请时建立，
+    // 否则被邀请为 viewer 的成员 primaryRole 恒为 owner，只读守卫永远不触发）
     db::with_db(|c| {
         c.execute(
             "INSERT INTO users (id, email, passwordHash, salt, role, createdAt) VALUES (?,?,?,?,?,?)",
             rusqlite::params![uid, email, hash, salt, "member", auth::now_iso()],
-        )
-        .ok();
-        // 自动建默认组织
-        let org_id = auth::gen_uuid();
-        c.execute(
-            "INSERT INTO orgs (id, name, ownerUserId, quotaMonitorMonthly, createdAt) VALUES (?,?,?,0,?)",
-            rusqlite::params![org_id, format!("{} 的团队", email), uid, auth::now_iso()],
-        )
-        .ok();
-        c.execute(
-            "INSERT INTO orgMembers (id, orgId, userId, role, createdAt) VALUES (?,?,?,?,?)",
-            rusqlite::params![auth::gen_uuid(), org_id, uid, "owner", auth::now_iso()],
         )
         .ok();
     });
@@ -1020,4 +1011,29 @@ pub async fn dashboard(headers: HeaderMap, axum::extract::Query(q): axum::extrac
     ) + &card("", &steps_html)
         + &card("平台与 Skills 的分工", division);
     html(layout(Some(&u), "十步工作台", "dashboard", &proj_id, &proj_id, &body))
+}
+
+/// viewer 只读守卫：只读成员禁止全部写操作（POST），仅放行登出（对齐 Node 版 server.js 角色守卫）。
+/// 以中间件单点实现，挂在路由层外圈；未登录的公开 POST（登录/注册）不受影响。
+pub async fn write_guard(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    if req.method() == axum::http::Method::POST {
+        let path = req.uri().path();
+        let open_posts = ["/login", "/register", "/logout", "/healthz"];
+        if !open_posts.contains(&path) {
+            if let Some(u) = current_user(req.headers()) {
+                let role: String = db::with_db(|c| {
+                    c.query_row(
+                        "SELECT om.role FROM orgMembers om WHERE om.userId=? ORDER BY om.createdAt LIMIT 1",
+                        [&u.id],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or_default()
+                });
+                if role == "viewer" {
+                    return html403("你的账号为「只读」角色，无写入权限。请联系团队管理员调整角色。");
+                }
+            }
+        }
+    }
+    next.run(req).await
 }

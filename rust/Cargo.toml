@@ -18,5 +18,6 @@ hmac = "0.12"
 rand = "0.8"
 scrypt = "0.11"
 serde_urlencoded = "0.7"
+ureq = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json"] }

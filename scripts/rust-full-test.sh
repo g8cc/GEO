@@ -220,6 +220,22 @@ check "T3.8 API 读回问题数据" "$(echo "$APIQ" | grep -q '"ok":true' && ech
 C=$(curl -s -o /dev/null -w "%{http_code} %{redirect_url}" -d "email=x@y.local&password=abc&agree=1" "$BASE/register")
 check "T3.9 弱密码注册被拒" "$(echo "$C" | grep -q '/register?error' && echo true)" ""
 
+# ===== T5: 角色守卫（viewer 只读拦截）=====
+echo ""
+echo "═══ T5: 角色守卫 ═══"
+VMAIL="viewer-t2-$(date +%s)@geo.local"
+VPW="viewer123"
+curl -s -o /dev/null -d "email=$VMAIL&password=$VPW&agree=1" "$BASE/register"
+curl -s -b "$COOKIE" -o /dev/null -d "email=$VMAIL&role=viewer" "$BASE/team/invite"
+VC=$(curl -s -c /tmp/v-cookie.txt -o /dev/null -w "%{http_code}" -d "email=$VMAIL&password=$VPW" "$BASE/login")
+check "T5.1 viewer 登录" "$([ "$VC" = "303" ] && echo true)" ""
+VPOST=$(curl -s -b /tmp/v-cookie.txt -o /dev/null -w "%{http_code}" -X POST --data "name=不应创建" "$BASE/companies/create")
+check "T5.2 viewer POST → 403" "$([ "$VPOST" = "403" ] && echo true)" "code=$VPOST"
+VGET=$(curl -s -b /tmp/v-cookie.txt -o /dev/null -w "%{http_code}" "$BASE/companies")
+check "T5.3 viewer GET 正常放行" "$([ "$VGET" = "200" ] && echo true)" "code=$VGET"
+VLOGOUT=$(curl -s -b /tmp/v-cookie.txt -o /dev/null -w "%{http_code}" "$BASE/logout")
+check "T5.4 viewer 登出放行" "$([ "$VLOGOUT" = "303" ] && echo true)" "code=$VLOGOUT"
+
 # ===== T4: 安全与 404 =====
 echo ""
 echo "═══ T4: 安全与 404 ═══"

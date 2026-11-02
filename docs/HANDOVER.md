@@ -1,5 +1,11 @@
 # 项目交接文档
 
+> **⚠️ 架构定位（v1.6.3）**：主实现已切换为 `rust/`（Axum 单二进制，23 页 Web UI + Open API）。
+> 本文的代码地图与设计决策描述的是 **Node 参考实现（platform/）**，其中「所有权集中守卫 / Label 成对返回 /
+> 写操作两步制 / 密钥只显示一次」等设计原则在 Rust 版同样成立（分别由 require_project/require_admin、
+> ui.rs label、Open API plan 端点、openKeys 哈希存储承担）。运维命令见 `docs/OPERATIONS.md`（geo-ctl），
+> 部署见 `docs/DEPLOYMENT.md`（ops/install.sh）。
+
 > 读者：接手开发/维护的工程师。目标：30 分钟建立全貌，半天能改第一个功能。
 
 ## 1. 仓库地图

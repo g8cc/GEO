@@ -1235,6 +1235,8 @@ pub fn run_checkpoint(conn: &Connection, cp_id: &str) -> Result<(), String> {
     let qids: Vec<String> = serde_json::from_str(&qids_raw).unwrap_or_default();
     let platforms: Vec<i64> = serde_json::from_str(&plats_raw).unwrap_or_else(|_| vec![1]);
 
+    let mut results_n = 0i64;
+    let mut exact_hits = 0i64;
     for qid in &qids {
         let qtext: String = match conn.query_row("SELECT text FROM questions WHERE id=?", [qid], |r| r.get(0)) {
             Ok(t) => t,
@@ -1242,6 +1244,8 @@ pub fn run_checkpoint(conn: &Connection, cp_id: &str) -> Result<(), String> {
         };
         for platform in &platforms {
             let r = run_monitor(conn, &p, &qtext, *platform, day as u32);
+            results_n += 1;
+            exact_hits += r.exact_url_hit;
             conn.execute(
                 "INSERT INTO monitorResults (id, taskId, checkpointId, projectId, questionId, platform, ranAt, answerText, brandMentioned, mentionPosition, brandAccurate, recommendLevel, recommendReason, competitors, citations, keywords, hitStatus, pageAccessible, nextStep, nextOptimize, exactUrlHit, dataSource) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'mock')",
                 rusqlite::params![
@@ -1266,6 +1270,15 @@ pub fn run_checkpoint(conn: &Connection, cp_id: &str) -> Result<(), String> {
         .query_row("SELECT COUNT(*) FROM monitorCheckpoints WHERE taskId=? AND status=1", [&tid], |r| r.get(0))
         .unwrap_or(0);
     conn.execute("UPDATE monitorTasks SET status=? WHERE id=?", rusqlite::params![if remaining > 0 { 2 } else { 3 }, tid]).ok();
+    // 终局-C：监测完成事件通知（后台线程推送，不阻塞）
+    if let Some(org) = org_of_project(conn, &pid) {
+        notify_org(
+            conn,
+            &org,
+            "monitor.done",
+            serde_json::json!({"taskId": tid, "checkpointDay": day, "results": results_n, "exactUrlHits": exact_hits}),
+        );
+    }
     Ok(())
 }
 
@@ -1491,15 +1504,17 @@ pub fn confirm_publish_task(conn: &Connection, tid: &str) -> Result<(), String> 
 
 // mock 结算：把「发布中」超过 4 秒的任务标记为已发布（catch-up 模式，页面访问时触发）
 pub fn catch_up_publish(conn: &Connection) {
-    let pending: Vec<(String, i64, String)> = {
-        let mut stmt = match conn.prepare("SELECT id, platform, articleId FROM publishTasks WHERE status=2") {
+    let pending: Vec<(String, i64, String, String)> = {
+        let mut stmt = match conn.prepare("SELECT id, platform, articleId, projectId FROM publishTasks WHERE status=2") {
             Ok(s) => s,
             Err(_) => return,
         };
-        let rs = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?)));
+        let rs = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?))
+        });
         rs.map(|x| x.filter_map(|y| y.ok()).collect()).unwrap_or_default()
     };
-    for (tid, platform, article_id) in pending {
+    for (tid, platform, article_id, pid) in pending {
         let created: String = conn.query_row("SELECT createdAt FROM publishTasks WHERE id=?", [&tid], |r| r.get(0)).unwrap_or_default();
         let age_ms = chrono::DateTime::parse_from_rfc3339(&created)
             .map(|t| (chrono::Utc::now() - t.with_timezone(&chrono::Utc)).num_milliseconds())
@@ -1519,13 +1534,16 @@ pub fn catch_up_publish(conn: &Connection) {
         )
         .ok();
         conn.execute("UPDATE articles SET status=3, updatedAt=? WHERE id=? AND status=2", rusqlite::params![now(), article_id]).ok();
+        if let Some(org) = org_of_project(conn, &pid) {
+            notify_org(conn, &org, "publish.done", serde_json::json!({"taskId": tid, "publishedUrl": url}));
+        }
     }
 }
 
 pub fn mark_published(conn: &Connection, tid: &str, url: &str) -> Result<(), String> {
-    let (status, existing_url, article_id): (i64, Option<String>, String) = conn
-        .query_row("SELECT status, publishedUrl, articleId FROM publishTasks WHERE id=?", [tid], |r| {
-            Ok((r.get(0)?, r.get::<_, Option<String>>(1)?, r.get(2)?))
+    let (status, existing_url, article_id, pid): (i64, Option<String>, String, String) = conn
+        .query_row("SELECT status, publishedUrl, articleId, projectId FROM publishTasks WHERE id=?", [tid], |r| {
+            Ok((r.get(0)?, r.get::<_, Option<String>>(1)?, r.get(2)?, r.get(3)?))
         })
         .map_err(|_| "发布任务不存在".to_string())?;
     if status == 3 && existing_url.map(|u| !u.is_empty()).unwrap_or(false) {
@@ -1544,6 +1562,9 @@ pub fn mark_published(conn: &Connection, tid: &str, url: &str) -> Result<(), Str
     )
     .ok();
     conn.execute("UPDATE articles SET status=3, updatedAt=? WHERE id=? AND status<3", rusqlite::params![now(), article_id]).ok();
+    if let Some(org) = org_of_project(conn, &pid) {
+        notify_org(conn, &org, "publish.done", serde_json::json!({"taskId": tid, "publishedUrl": url}));
+    }
     Ok(())
 }
 
@@ -2163,4 +2184,143 @@ pub fn auto_geo(conn: &Connection, user_id: &str, raw: &str) -> Result<AutoGeoRe
             "第 3/7/14 天用同一问题复测".to_string(),
         ],
     })
+}
+
+// ============ 事件通知（对齐 Node 版 notifyOrg：monitor.done / publish.done） ============
+/// 通知载荷（与 Node 版 notifyOrg 同构：{event, orgId, at, data}）
+pub fn notify_payload(event: &str, org_id: &str, data: &Value) -> String {
+    serde_json::json!({"event": event, "orgId": org_id, "at": now(), "data": data}).to_string()
+}
+
+/// 事件是否启用（notifyEvents JSON 数组过滤；解析失败回落默认全开，与 Node 一致）
+pub fn event_enabled(notify_events_json: &str, event: &str) -> bool {
+    let list: Vec<String> = serde_json::from_str(notify_events_json)
+        .unwrap_or_else(|_| vec!["monitor.done".to_string(), "publish.done".to_string()]);
+    list.iter().any(|x| x == event)
+}
+
+/// 同步推送（10s 超时；仅供测试与 async 包装使用）
+pub fn notify_fire(webhook: &str, body: &str) -> Result<u16, String> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(10))
+        .build();
+    let resp = agent
+        .post(webhook)
+        .set("Content-Type", "application/json")
+        .send_string(body)
+        .map_err(|e| format!("webhook 推送失败: {}", e))?;
+    Ok(resp.status())
+}
+
+/// 后台推送（fire-and-forget，独立线程，绝不阻塞请求/DB 锁；失败仅记录不重试——与 Node 语义一致）
+pub fn notify_org_async(org_id: &str, webhook: &str, events_json: &str, event: &'static str, data: Value) {
+    if webhook.trim().is_empty() || !event_enabled(events_json, event) {
+        return;
+    }
+    let body = notify_payload(event, org_id, &data);
+    let wh = webhook.to_string();
+    std::thread::spawn(move || {
+        if let Err(e) = notify_fire(&wh, &body) {
+            eprintln!("[notify] {} 推送失败: {}", event, e);
+        }
+    });
+}
+
+/// 读取组织通知配置并异步推送（在任何 with_db 闭包内调用安全：推送线程不触碰 DB 锁）
+pub fn notify_org(conn: &Connection, org_id: &str, event: &'static str, data: Value) {
+    if org_id.is_empty() {
+        return;
+    }
+    let (webhook, events): (String, String) = conn
+        .query_row(
+            "SELECT COALESCE(notifyWebhook,''), COALESCE(notifyEvents,'[]') FROM orgs WHERE id=?",
+            [org_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap_or_default();
+    notify_org_async(org_id, &webhook, &events, event, data);
+}
+
+#[cfg(test)]
+mod notify_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    #[test]
+    fn test_notify_payload_shape() {
+        let body = notify_payload("monitor.done", "org-1", &serde_json::json!({"taskId": "t1"}));
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["event"], "monitor.done");
+        assert_eq!(v["orgId"], "org-1");
+        assert_eq!(v["data"]["taskId"], "t1");
+        assert!(v["at"].as_str().unwrap().contains("T"));
+    }
+
+    #[test]
+    fn test_event_enabled_filter() {
+        assert!(event_enabled(r#"["monitor.done","publish.done"]"#, "monitor.done"));
+        assert!(!event_enabled(r#"["monitor.done"]"#, "publish.done"));
+        // 解析失败回落默认全开（与 Node 版一致）
+        assert!(event_enabled("not-json", "publish.done"));
+    }
+
+    #[test]
+    fn test_notify_fire_real_http() {
+        // 本地 TCP 监听器充当 webhook 接收端，验证真实 HTTP 推送链路
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            // 读满整个请求头（单次 read 可能只到半个头，提前关连接会让 ureq 撞 RST）
+            let mut buf: Vec<u8> = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let mut body_left: i64 = -1;
+            loop {
+                let n = sock.read(&mut chunk).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&buf).to_string();
+                if body_left < 0 {
+                    if let Some(pos) = text.find("\r\n\r\n") {
+                        // 头已完整：按 Content-Length 读满 body，避免提前关闭撞 RST
+                        body_left = text
+                            .lines()
+                            .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+                            .and_then(|l| l.split(':').nth(1))
+                            .and_then(|v| v.trim().parse::<i64>().ok())
+                            .unwrap_or(0);
+                        body_left -= (buf.len() - pos - 4) as i64;
+                        if body_left <= 0 {
+                            break;
+                        }
+                    }
+                } else {
+                    body_left -= n as i64;
+                    if body_left <= 0 {
+                        break;
+                    }
+                }
+            }
+            let req = String::from_utf8_lossy(&buf).to_string();
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").unwrap();
+            req
+        });
+        let body = notify_payload("publish.done", "org-x", &serde_json::json!({"taskId": "t-9"}));
+        let status = notify_fire(&format!("http://127.0.0.1:{}", port), &body).unwrap();
+        assert_eq!(status, 200);
+        let req = handle.join().unwrap();
+        assert!(req.starts_with("POST / HTTP/1.1"));
+        assert!(req.contains("Content-Type: application/json"));
+        assert!(req.contains("\"event\":\"publish.done\""));
+    }
+
+    #[test]
+    fn test_notify_fire_unreachable_is_err() {
+        // 不可达端口：返回 Err 而非 panic（后台线程吞掉错误）
+        assert!(notify_fire("http://127.0.0.1:1", "{}").is_err());
+    }
 }

@@ -24,7 +24,7 @@
 
 ## C. 功能验收（关键链路演示脚本，约 10 分钟）
 
-1. `cd platform && node server.js` → http://localhost:3438 登录（demo@geo.local / demo1234）；
+1. `make verify` 全绿（含渲染级截图）；`bash ops/install.sh` 或 `make run` 启动 → http://localhost:3439 登录（demo@geo.local / demo1234）；
 2. 工作台 → 演示项目 → 知识库（六模块 + 待补充 + 口径冲突）；
 3. 问题拓展 → 生成 50 问 → 精简 40 问（探索30/评估5/行动5）；
 4. 内容创作 → 选问题 → 创作前检查 → 生成品牌文章（含封面）；
