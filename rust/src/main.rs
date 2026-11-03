@@ -10,6 +10,7 @@ mod ops;
 mod mock;
 mod ui;
 mod llm;
+mod image;
 
 use axum::{routing::{get, post}, Router};
 use std::net::SocketAddr;

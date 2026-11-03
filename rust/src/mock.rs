@@ -693,7 +693,7 @@ fn extract_title(question: &str) -> String {
 #[allow(clippy::too_many_arguments)]
 /// 锁内版本：模板生成（auto_geo 等闭包内场景使用）
 pub fn create_content_locked(conn: &Connection, pid: &str, qid: &str, ctype: i64) -> Result<(String, String), String> {
-    create_content_insert(conn, pid, qid, ctype, None)
+    create_content_insert(conn, pid, qid, ctype, None, None)
 }
 
 /// 公开版本（两阶段）：配置了 LLM → 锁外真实生成（失败回落模板并记录）；未配置 → 模板
@@ -725,11 +725,12 @@ pub fn create_content_full(pid: &str, qid: &str, ctype: i64) -> Result<(String, 
         Ok(Some((cfg, prompt, question)))
     })?;
 
-    // Phase B（锁外）：真实生成
-    let llm_out: Option<(String, String)> = match prep {
-        Some((cfg, prompt, question)) => match llm::chat(&cfg, &prompt, Some(llm::ARTICLE_SYSTEM), 90) {
+    // Phase B（锁外）：真实生成正文 + 真实封面（配置了 IMAGE_API_KEY 时）
+    let img_cfg: Option<crate::image::ImageCfg> = db::with_db(crate::image::cover_cfg);
+    let llm_out: Option<(String, String)> = match &prep {
+        Some((cfg, prompt, question)) => match llm::chat(cfg, prompt, Some(llm::ARTICLE_SYSTEM), 90) {
             Ok(text) => {
-                let (t, c) = llm::parse_article_json(&text, &question);
+                let (t, c) = llm::parse_article_json(&text, question);
                 Some((t, c))
             }
             Err(e) => {
@@ -739,12 +740,26 @@ pub fn create_content_full(pid: &str, qid: &str, ctype: i64) -> Result<(String, 
         },
         None => None,
     };
+    // 封面标题：优先 LLM 标题，否则从问题推导（与模板标题同源）
+    let cover_title = llm_out
+        .as_ref()
+        .map(|(t, _)| t.clone())
+        .unwrap_or_else(|| match &prep {
+            Some((_, _, q)) => {
+                let q: String = q.chars().filter(|c| *c != '？' && *c != '?').collect();
+                crate::ui::trunc(&q, 30).trim_end_matches('\u{2026}').to_string()
+            }
+            None => String::new(),
+        });
+    let cover = img_cfg
+        .as_ref()
+        .map(|c| crate::image::generate_cover_with(c, pid, &cover_title));
 
-    // Phase C（锁内）：封面 + 入库
-    db::with_db(|conn| create_content_insert(conn, pid, qid, ctype, llm_out))
+    // Phase C（锁内）：入库
+    db::with_db(|conn| create_content_insert(conn, pid, qid, ctype, llm_out, cover))
 }
 
-fn create_content_insert(conn: &Connection, pid: &str, qid: &str, ctype: i64, llm_out: Option<(String, String)>) -> Result<(String, String), String> {
+fn create_content_insert(conn: &Connection, pid: &str, qid: &str, ctype: i64, llm_out: Option<(String, String)>, cover: Option<crate::image::CoverGen>) -> Result<(String, String), String> {
     let p = get_project(conn, pid).ok_or_else(|| "项目不存在".to_string())?;
     let question: String = conn
         .query_row("SELECT text FROM questions WHERE id=? AND projectId=?", [qid, pid], |r| r.get(0))
@@ -805,12 +820,15 @@ fn create_content_insert(conn: &Connection, pid: &str, qid: &str, ctype: i64, ll
         None => (title, content, forms),
     };
 
-    // 封面素材
-    let cover_url = generate_cover_svg(&title, pid);
+    // 封面素材（真实生成已在锁外完成；未提供时回落内置 SVG）
+    let (cover_url, cover_meta) = match &cover {
+        Some(c) => (c.url.clone(), json!({"kind": "cover", "articleQuestion": question, "coverSource": c.source, "imageGenerated": c.image_generated})),
+        None => (generate_cover_svg(&title, pid), json!({"kind": "cover", "articleQuestion": question, "coverSource": "svg-default", "imageGenerated": false})),
+    };
     let material_id = gen_id();
     conn.execute(
         "INSERT INTO materials (id, projectId, type, name, url, meta, createdAt) VALUES (?,?,?,?,?,?,?)",
-        rusqlite::params![material_id, pid, 1, format!("封面：{}", crate::ui::trunc(&title, 30)), cover_url, json!({"kind": "cover", "articleQuestion": question}).to_string(), now()],
+        rusqlite::params![material_id, pid, 1, format!("封面：{}", crate::ui::trunc(&title, 30)), cover_url, cover_meta.to_string(), now()],
     )
     .ok();
 

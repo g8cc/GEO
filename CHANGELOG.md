@@ -2,6 +2,14 @@
 
 本项目的所有重要变更记录在此文件。格式参考 Keep a Changelog。
 
+## [1.6.5] - 2026-11-04
+
+### Added
+- **封面图像真实化（二期真实化收官）**：`image.rs` 双 Provider——OpenAI 兼容 images/generations（b64_json 或 url 下载）与阿里云万相同步提交+异步轮询（3s×20 次上限，对齐 Node providers/image.js）；产物落本地 uploads，meta 记录 coverSource/imageGenerated；未配置或失败显式回落内置 SVG（coverSource=svg-fallback:<原因>），不产生"已生成"假象
+- **「系统设置 → 服务集成」补齐图像配置项**：IMAGE_PROVIDER / IMAGE_BASE_URL / IMAGE_MODEL / IMAGE_API_KEY
+- **封面生成锁纪律**：create_content_full 三阶段——锁内读配置与组提示词 → 锁外 LLM 正文 + 图像生成 → 锁内入库（图像生成 30s+60s 轮询绝不持 DB 锁）
+- **测试 +3**（37 项总计）：OpenAI b64 落盘校验、万相三段交互（提交→轮询→下载）、失败回落链
+
 ## [1.6.4] - 2026-11-04
 
 ### Added
