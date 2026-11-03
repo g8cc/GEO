@@ -101,7 +101,7 @@ pub async fn content_create(headers: HeaderMap, Path(pid): Path<String>, fb: Fb)
         return redirect_q(&format!("/projects/{}/content", pid), &[("e", "请先选择一个目标问题")]);
     }
     let ctype = fb.opt_i("type").unwrap_or(2);
-    let result = db::with_db(|c| mock::create_content(c, &pid, &qid, ctype));
+    let result = mock::create_content_full(&pid, &qid, ctype);
     match result {
         Ok((aid, _title)) => {
             crate::web::audit_log(Some(&u.id), &u.email, "content.create", &aid, &crate::web::client_ip(&headers));
@@ -702,8 +702,8 @@ pub async fn monitor(headers: HeaderMap, Path(pid): Path<String>) -> Response {
         Ok(u) => u,
         Err(r) => return r,
     };
+    mock::run_due_checkpoints(&pid); // 到期复测（真实平台网调在锁外）
     let body = db::with_db(|c| {
-        mock::run_due_checkpoints(c, &pid); // 到期复测
         let mut stmt = c.prepare("SELECT id, text FROM questions WHERE projectId=? ORDER BY priority, createdAt").unwrap();
         let questions: Vec<(String, String)> = stmt.query_map([&pid], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().filter_map(|x| x.ok()).collect();
         let mut stmt = c
@@ -810,9 +810,12 @@ pub async fn monitor_create(headers: HeaderMap, Path(pid): Path<String>, fb: Fb)
         mode,
         schedule_days: if mode == 2 { vec![3, 7, 14] } else { vec![] },
     };
-    match db::with_db(|c| mock::create_monitor_task(c, &pid, &input)) {
-        Ok(_tid) => {
-            crate::web::audit_log(Some(&u.id), &u.email, "monitorTasks.create", &pid, &crate::web::client_ip(&headers));
+    match db::with_db(|c| mock::create_monitor_task_locked(c, &pid, &input, false)) {
+        Ok((tid, first_cp)) => {
+            if let Err(e) = mock::run_checkpoint_full(&first_cp) {
+                return redirect_q(&format!("/projects/{}/monitor", pid), &[("e", &e)]);
+            }
+            crate::web::audit_log(Some(&u.id), &u.email, "monitorTasks.create", &tid, &crate::web::client_ip(&headers));
             redirect(&format!("/projects/{}/monitor", pid))
         }
         Err(e) => redirect_q(&format!("/projects/{}/monitor", pid), &[("e", &e)]),
@@ -838,8 +841,8 @@ pub async fn monitor_detail(headers: HeaderMap, Path(tid): Path<String>) -> Resp
     if !crate::web::project_owned(&u.id, &pid) {
         return crate::web::html404();
     }
+    mock::run_due_checkpoints(&pid); // 到期复测（真实平台网调在锁外）
     let body = db::with_db(|c| {
-        mock::run_due_checkpoints(c, &pid);
         let qids: Vec<String> = serde_json::from_str(&qids_raw).unwrap_or_default();
         let question_texts: Vec<String> = qids
             .iter()
@@ -981,9 +984,7 @@ pub async fn monitor_runnext(headers: HeaderMap, Path(tid): Path<String>) -> Res
     if pid.is_empty() || !crate::web::project_owned(&u.id, &pid) {
         return crate::web::html404();
     }
-    db::with_db(|c| {
-        let _ = mock::force_run_next_checkpoint(c, &tid);
-    });
+    let _ = mock::force_run_next_checkpoint(&tid);
     crate::web::audit_log(Some(&u.id), &u.email, "monitorTasks.runNext", &tid, &crate::web::client_ip(&headers));
     redirect(&format!("/monitor/{}", tid))
 }

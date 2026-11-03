@@ -9,6 +9,7 @@ mod static_files;
 mod ops;
 mod mock;
 mod ui;
+mod llm;
 
 use axum::{routing::{get, post}, Router};
 use std::net::SocketAddr;

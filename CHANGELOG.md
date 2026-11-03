@@ -2,6 +2,18 @@
 
 本项目的所有重要变更记录在此文件。格式参考 Keep a Changelog。
 
+## [1.6.4] - 2026-11-04
+
+### Added
+- **真实 LLM 生成（二期真实化第一段）**：OpenAI 兼容客户端（ureq，settings 表优先/环境变量回落）；内容创作三类文章、50 问生成、知识库整理在配置 `LLM_BASE_URL/LLM_API_KEY/LLM_MODEL` 后走真实调用（方法论提示词原文移植），失败显式回落模板并记录——语义对齐 Node 版 providers/llm.js
+- **真实 AI 监测（四平台）**：豆包（火山方舟）/DeepSeek/元宝（混元）/通义（百炼）均为 OpenAI 兼容端点，配置对应 `MONITOR_*_KEY` 即走真实联网问答；引用来源多形态提取（annotations / DashScope search_result / 混元 search_info / 通用兜底），我方判定=URL 与已发布正式链接精确匹配，品牌表现保守启发式——对齐 Node runMonitorReal；未配置平台回落确定性 mock（dataSource 区分 real-llm/mock）
+- **锁纪律重构**：run_checkpoint 拆两阶段（网调在锁外），修复"真实监测长调用持 DB 锁阻塞全站"的隐患；create_monitor_task/reputation/content/questions50/organize 均拆 locked（闭包内模板）+ full（公开两阶段）变体
+- **测试 +10**：mock OpenAI 服务器真实调用、文章 JSON 解析与兜底、引用多形态提取与去重、我方精确匹配命中分级、create_content 全流程真实→回落、推理模型 reasoning 兜底（合计 34 项单元/集成测试）
+
+### Fixed
+- **Node 版潜在 bug**：providers/llm.js 的 `parseQuestionLines` 未定义——配置真实 LLM 后 50 问路径会 ReferenceError（真实路径从未跑通过）；Rust 版实现宽容解析器（序号/维度/口语行）
+- **测试竞态**：notify/llm mock 服务器早关连接致偶发 RST——改为 Content-Length 感知完整读取
+
 ## [1.6.3] - 2026-11-03
 
 ### Added

@@ -16,8 +16,8 @@ pub async fn wom(headers: HeaderMap, Path(pid): Path<String>, Query(q): Query<Ha
         Ok(u) => u,
         Err(r) => return r,
     };
+    mock::run_due_checkpoints(&pid); // 到期复测（真实平台网调在锁外）
     let body = db::with_db(|c| {
-        mock::run_due_checkpoints(c, &pid);
         let tasks: Vec<(String, String, i64, i64, String)> = {
             let mut stmt = c.prepare("SELECT id, createdAt, mode, status, questionIds FROM monitorTasks WHERE projectId=? ORDER BY createdAt DESC").unwrap();
             stmt.query_map([&pid], |r| {
@@ -134,8 +134,11 @@ pub async fn wom_create(headers: HeaderMap, Path(pid): Path<String>, fb: Fb) -> 
     let platforms: Vec<i64> = fb.all("platforms").iter().filter_map(|s| s.parse().ok()).collect();
     let platforms = if platforms.is_empty() { vec![1] } else { platforms };
     let mode = fb.opt_i("mode").unwrap_or(2);
-    match db::with_db(|c| mock::create_reputation_monitor(c, &pid, platforms, mode)) {
-        Ok(_) => {
+    match db::with_db(|c| mock::create_reputation_monitor_locked(c, &pid, platforms, mode, false)) {
+        Ok((_added, _tid, first_cp)) => {
+            if let Err(e) = mock::run_checkpoint_full(&first_cp) {
+                return redirect_q(&format!("/projects/{}/wom", pid), &[("e", &e)]);
+            }
             crate::web::audit_log(Some(&u.id), &u.email, "reputation.create", &pid, &crate::web::client_ip(&headers));
             redirect(&format!("/projects/{}/wom", pid))
         }

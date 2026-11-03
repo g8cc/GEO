@@ -461,10 +461,8 @@ pub async fn kb_organize(headers: HeaderMap, Path(pid): Path<String>, fb: Fb) ->
         Err(r) => return r,
     };
     let ktype = fb.i("type");
-    db::with_db(|c| {
-        let brand = mock::get_project(c, &pid).map(|p| p.brand_name).unwrap_or_default();
-        mock::organize_knowledge(c, &pid, ktype, &brand, &fb.get("raw"));
-    });
+    let brand = db::with_db(|c| mock::get_project(c, &pid).map(|p| p.brand_name).unwrap_or_default());
+    mock::organize_knowledge_full(&pid, ktype, &brand, &fb.get("raw"));
     crate::web::audit_log(Some(&u.id), &u.email, "kb.organize", &pid, &crate::web::client_ip(&headers));
     redirect(&format!("/projects/{}/kb?type={}", pid, ktype))
 }
@@ -648,13 +646,11 @@ pub async fn questions_generate(headers: HeaderMap, Path(pid): Path<String>, fb:
         Err(r) => return r,
     };
     let mode = fb.get("mode");
-    db::with_db(|c| {
-        if mode == "40" {
-            mock::simplify_to_40(c, &pid);
-        } else {
-            mock::generate_questions_50(c, &pid);
-        }
-    });
+    if mode == "40" {
+        db::with_db(|c| mock::simplify_to_40(c, &pid));
+    } else {
+        mock::generate_questions_50_full(&pid);
+    }
     crate::web::audit_log(Some(&u.id), &u.email, "question.generate", &format!("{} ({})", pid, mode), &crate::web::client_ip(&headers));
     redirect(&format!("/projects/{}/questions", pid))
 }

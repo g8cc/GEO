@@ -4,6 +4,9 @@ use rusqlite::Connection;
 use serde_json::{json, Value};
 
 use crate::auth;
+use crate::db;
+use crate::llm;
+use crate::llm::LlmConfig;
 use crate::ui::{jaccard, tokenize, PUBLISH_DOMAIN};
 
 pub fn now() -> String {
@@ -255,11 +258,48 @@ pub struct OrganizeResult {
     pub doc_count: usize,
 }
 
-pub fn organize_knowledge(conn: &Connection, pid: &str, ktype: i64, brand: &str, raw: &str) -> OrganizeResult {
+/// 公开版本（两阶段）：配置了 LLM → 锁外整理（失败回落模板）；QA 索引按 Node LLM 语义
+pub fn organize_knowledge_full(pid: &str, ktype: i64, brand: &str, raw: &str) -> OrganizeResult {
+    let llm_text: Option<String> = db::with_db(|conn| {
+        if !llm::is_real(conn) {
+            return None;
+        }
+        llm::load_llm_config(conn).and_then(|cfg| llm::chat(&cfg, &llm::prompt_organize_knowledge(brand, raw), None, 120).ok())
+    });
+    db::with_db(|conn| organize_knowledge_insert(conn, pid, ktype, brand, llm_text, raw))
+}
+
+/// 锁内版本：模板整理
+pub fn organize_knowledge_locked(conn: &Connection, pid: &str, ktype: i64, brand: &str, raw: &str) -> OrganizeResult {
+    organize_knowledge_insert(conn, pid, ktype, brand, None, raw)
+}
+
+fn organize_knowledge_insert(conn: &Connection, pid: &str, ktype: i64, brand: &str, llm_text: Option<String>, raw: &str) -> OrganizeResult {
     let kb_id = match get_kb_id(conn, pid, ktype) {
         Some(k) => k,
         None => return OrganizeResult { doc_count: 0 },
     };
+    // LLM 路径：按 ## NN_ 分段入库（对齐 Node organizeWithLlm；失败由调用方回落模板）
+    if let Some(text) = &llm_text {
+        let docs = crate::llm::parse_organize_sections(text);
+        if !docs.is_empty() {
+            for d in &docs {
+                conn.execute(
+                    "INSERT INTO kbDocuments (id, kbId, module, title, content, evidence, pending, source, updatedAt) VALUES (?,?,?,?,?,?,?,?,?)",
+                    rusqlite::params![gen_id(), kb_id, d.module, d.title, d.content, "[]", d.pending, "LLM 整理", now()],
+                )
+                .ok();
+            }
+            let qa = serde_json::json!({"note": "LLM 整理（答案必须能回溯到六大模块）", "items": []});
+            conn.execute(
+                "UPDATE knowledgeBases SET qaIndex=?, conflictList='', updatedAt=? WHERE id=?",
+                rusqlite::params![qa.to_string(), now(), kb_id],
+            )
+            .ok();
+            return OrganizeResult { doc_count: docs.len() };
+        }
+        // 解析不出段落 → 回落模板
+    }
     let lines: Vec<&str> = raw.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
     let mut buckets: [Vec<&str>; 7] = [vec![], vec![], vec![], vec![], vec![], vec![], vec![]];
     let mut conflicts: Vec<String> = Vec::new();
@@ -396,7 +436,37 @@ fn add_question(conn: &Connection, pid: &str, text: &str, category: i64, stage: 
     true
 }
 
-pub fn generate_questions_50(conn: &Connection, pid: &str) -> usize {
+/// 公开版本（两阶段）：配置了 LLM → 锁外真实生成 50 问（失败回落模板）
+pub fn generate_questions_50_full(pid: &str) -> usize {
+    let prep: Option<(LlmConfig, String)> = db::with_db(|conn| {
+        if !llm::is_real(conn) {
+            return None;
+        }
+        let cfg = llm::load_llm_config(conn)?;
+        let p = get_project(conn, pid)?;
+        Some((cfg, llm::prompt_questions50(&p)))
+    });
+    if let Some((cfg, prompt)) = prep {
+        match llm::chat(&cfg, &prompt, None, 90) {
+            Ok(text) => {
+                return db::with_db(|conn| {
+                    let mut n = 0;
+                    for (qtext, dim) in llm::parse_question_lines(&text) {
+                        if add_question(conn, pid, &qtext, 2, 1, 2, "50问生成", &dim) {
+                            n += 1;
+                        }
+                    }
+                    n
+                });
+            }
+            Err(e) => eprintln!("[llm] 50问真实生成失败，回落模板：{}", e),
+        }
+    }
+    db::with_db(|conn| generate_questions_50_locked(conn, pid))
+}
+
+/// 锁内版本：模板生成
+pub fn generate_questions_50_locked(conn: &Connection, pid: &str) -> usize {
     let p = match get_project(conn, pid) {
         Some(p) => p,
         None => return 0,
@@ -621,7 +691,60 @@ fn extract_title(question: &str) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn create_content(conn: &Connection, pid: &str, qid: &str, ctype: i64) -> Result<(String, String), String> {
+/// 锁内版本：模板生成（auto_geo 等闭包内场景使用）
+pub fn create_content_locked(conn: &Connection, pid: &str, qid: &str, ctype: i64) -> Result<(String, String), String> {
+    create_content_insert(conn, pid, qid, ctype, None)
+}
+
+/// 公开版本（两阶段）：配置了 LLM → 锁外真实生成（失败回落模板并记录）；未配置 → 模板
+pub fn create_content_full(pid: &str, qid: &str, ctype: i64) -> Result<(String, String), String> {
+    // Phase A（锁内）：校验 + 取材 + 组提示词
+    let prep: Option<(LlmConfig, String, String)> = db::with_db(|conn| -> Result<Option<(LlmConfig, String, String)>, String> {
+        if !llm::is_real(conn) {
+            return Ok(None);
+        }
+        let p = get_project(conn, pid).ok_or_else(|| "项目不存在".to_string())?;
+        let question: String = conn
+            .query_row("SELECT text FROM questions WHERE id=? AND projectId=?", [qid, pid], |r| r.get(0))
+            .map_err(|_| "请先在上方选择一个目标问题".to_string())?;
+        let brand_docs = get_kb_id(conn, pid, 1).map(|k| get_kb_docs(conn, &k)).unwrap_or_default();
+        let product_docs = get_kb_id(conn, pid, 2).map(|k| get_kb_docs(conn, &k)).unwrap_or_default();
+        let cfg = llm::load_llm_config(conn).ok_or_else(|| "LLM 未配置".to_string())?;
+        let mut facts = pick_facts(&brand_docs, &question, 10);
+        facts.extend(pick_facts(&product_docs, &question, 6));
+        let kb_context = if facts.is_empty() {
+            "（知识库为空，全部按待补充处理）".to_string()
+        } else {
+            facts.iter().map(|f| format!("- {}（{}）", f.text, f.module_title)).collect::<Vec<_>>().join("\n")
+        };
+        let prompt = match ctype {
+            1 => llm::prompt_answer_card(&question),
+            2 => llm::prompt_brand_article(&question),
+            _ => llm::prompt_product_article(&question, &p.product_name),
+        } + &format!("\n\n【知识库事实（唯一事实来源，缺失信息标注待补充）】\n{}", kb_context);
+        Ok(Some((cfg, prompt, question)))
+    })?;
+
+    // Phase B（锁外）：真实生成
+    let llm_out: Option<(String, String)> = match prep {
+        Some((cfg, prompt, question)) => match llm::chat(&cfg, &prompt, Some(llm::ARTICLE_SYSTEM), 90) {
+            Ok(text) => {
+                let (t, c) = llm::parse_article_json(&text, &question);
+                Some((t, c))
+            }
+            Err(e) => {
+                eprintln!("[llm] 文章真实生成失败，回落模板：{}", e);
+                None
+            }
+        },
+        None => None,
+    };
+
+    // Phase C（锁内）：封面 + 入库
+    db::with_db(|conn| create_content_insert(conn, pid, qid, ctype, llm_out))
+}
+
+fn create_content_insert(conn: &Connection, pid: &str, qid: &str, ctype: i64, llm_out: Option<(String, String)>) -> Result<(String, String), String> {
     let p = get_project(conn, pid).ok_or_else(|| "项目不存在".to_string())?;
     let question: String = conn
         .query_row("SELECT text FROM questions WHERE id=? AND projectId=?", [qid, pid], |r| r.get(0))
@@ -670,6 +793,16 @@ pub fn create_content(conn: &Connection, pid: &str, qid: &str, ctype: i64) -> Re
             );
             (title, content, json!({"question": question, "template": "产品推荐文章"}))
         }
+    };
+
+    // LLM 真实生成结果覆盖模板（meta.source=llm）
+    let (title, content, forms) = match llm_out {
+        Some((lt, lc)) => {
+            let mut forms = forms;
+            forms["source"] = json!("llm");
+            (lt, lc, forms)
+        }
+        None => (title, content, forms),
     };
 
     // 封面素材
@@ -1161,7 +1294,8 @@ pub struct CreateMonitorInput {
     pub schedule_days: Vec<i64>,
 }
 
-pub fn create_monitor_task(conn: &Connection, pid: &str, input: &CreateMonitorInput) -> Result<String, String> {
+/// 锁内版本：建任务与检查点；run_now=true 时立即执行首轮（仅 mock 平台——auto_geo 等闭包内场景）
+pub fn create_monitor_task_locked(conn: &Connection, pid: &str, input: &CreateMonitorInput, run_now: bool) -> Result<(String, String), String> {
     if input.question_ids.is_empty() {
         return Err("至少选择一个问题".to_string());
     }
@@ -1218,11 +1352,38 @@ pub fn create_monitor_task(conn: &Connection, pid: &str, input: &CreateMonitorIn
         )
         .ok();
     }
-    run_checkpoint(conn, &first_cp)?;
-    Ok(tid)
+    if run_now {
+        run_checkpoint_locked(conn, &first_cp)?;
+    }
+    Ok((tid, first_cp))
 }
 
-pub fn run_checkpoint(conn: &Connection, cp_id: &str) -> Result<(), String> {
+fn insert_monitor_result(conn: &Connection, tid: &str, cp_id: &str, pid: &str, qid: &str, m: &MonitorMock, data_source: &str) {
+    conn.execute(
+        "INSERT INTO monitorResults (id, taskId, checkpointId, projectId, questionId, platform, ranAt, answerText, brandMentioned, mentionPosition, brandAccurate, recommendLevel, recommendReason, competitors, citations, keywords, hitStatus, pageAccessible, nextStep, nextOptimize, exactUrlHit, dataSource) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        rusqlite::params![
+            gen_id(), tid, cp_id, pid, qid, m.platform, now(), m.answer_text, m.brand_mentioned,
+            m.mention_position, m.brand_accurate, m.recommend_level, m.recommend_reason,
+            m.competitors.to_string(), m.citations.to_string(), m.keywords.to_string(),
+            m.hit_status, 1, m.next_step, m.next_optimize, m.exact_url_hit, data_source
+        ],
+    )
+    .ok();
+}
+
+fn finish_checkpoint(conn: &Connection, cp_id: &str, tid: &str, day: i64, pid: &str, results_n: i64, exact_hits: i64) {
+    conn.execute("UPDATE monitorCheckpoints SET status=2, ranAt=? WHERE id=?", rusqlite::params![now(), cp_id]).ok();
+    let remaining: i64 = conn
+        .query_row("SELECT COUNT(*) FROM monitorCheckpoints WHERE taskId=? AND status=1", [tid], |r| r.get(0))
+        .unwrap_or(0);
+    conn.execute("UPDATE monitorTasks SET status=? WHERE id=?", rusqlite::params![if remaining > 0 { 2 } else { 3 }, tid]).ok();
+    if let Some(org) = org_of_project(conn, pid) {
+        notify_org(conn, &org, "monitor.done", serde_json::json!({"taskId": tid, "checkpointDay": day, "results": results_n, "exactUrlHits": exact_hits}));
+    }
+}
+
+/// 锁内版本：仅 mock 平台（auto_geo 等 with_db 闭包内使用；真实平台在锁外由 run_checkpoint_full 处理）
+fn run_checkpoint_locked(conn: &Connection, cp_id: &str) -> Result<(), String> {
     let (tid, day): (String, i64) = conn
         .query_row("SELECT taskId, day FROM monitorCheckpoints WHERE id=?", [cp_id], |r| Ok((r.get(0)?, r.get(1)?)))
         .map_err(|_| "监测检查点不存在".to_string())?;
@@ -1246,16 +1407,7 @@ pub fn run_checkpoint(conn: &Connection, cp_id: &str) -> Result<(), String> {
             let r = run_monitor(conn, &p, &qtext, *platform, day as u32);
             results_n += 1;
             exact_hits += r.exact_url_hit;
-            conn.execute(
-                "INSERT INTO monitorResults (id, taskId, checkpointId, projectId, questionId, platform, ranAt, answerText, brandMentioned, mentionPosition, brandAccurate, recommendLevel, recommendReason, competitors, citations, keywords, hitStatus, pageAccessible, nextStep, nextOptimize, exactUrlHit, dataSource) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'mock')",
-                rusqlite::params![
-                    gen_id(), tid, cp_id, pid, qid, r.platform, now(), r.answer_text, r.brand_mentioned,
-                    r.mention_position, r.brand_accurate, r.recommend_level, r.recommend_reason,
-                    r.competitors.to_string(), r.citations.to_string(), r.keywords.to_string(),
-                    r.hit_status, 1, r.next_step, r.next_optimize, r.exact_url_hit
-                ],
-            )
-            .ok();
+            insert_monitor_result(conn, &tid, cp_id, &pid, qid, &r, "mock");
             if let Some(org) = org_of_project(conn, &pid) {
                 usage_increment(conn, &org, "monitor.calls");
             }
@@ -1265,44 +1417,163 @@ pub fn run_checkpoint(conn: &Connection, cp_id: &str) -> Result<(), String> {
             }
         }
     }
-    conn.execute("UPDATE monitorCheckpoints SET status=2, ranAt=? WHERE id=?", rusqlite::params![now(), cp_id]).ok();
-    let remaining: i64 = conn
-        .query_row("SELECT COUNT(*) FROM monitorCheckpoints WHERE taskId=? AND status=1", [&tid], |r| r.get(0))
-        .unwrap_or(0);
-    conn.execute("UPDATE monitorTasks SET status=? WHERE id=?", rusqlite::params![if remaining > 0 { 2 } else { 3 }, tid]).ok();
-    // 终局-C：监测完成事件通知（后台线程推送，不阻塞）
-    if let Some(org) = org_of_project(conn, &pid) {
-        notify_org(
-            conn,
-            &org,
-            "monitor.done",
-            serde_json::json!({"taskId": tid, "checkpointDay": day, "results": results_n, "exactUrlHits": exact_hits}),
-        );
-    }
+    finish_checkpoint(conn, cp_id, &tid, day, &pid, results_n, exact_hits);
     Ok(())
 }
 
-pub fn run_due_checkpoints(conn: &Connection, pid: &str) {
-    let due: Vec<String> = {
-        let mut stmt = match conn.prepare(
-            "SELECT cp.id FROM monitorCheckpoints cp JOIN monitorTasks t ON cp.taskId=t.id WHERE t.projectId=? AND cp.status=1 AND cp.day>0 AND cp.dueAt<=?",
-        ) {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        let rs = stmt.query_map([pid, &now()], |r| r.get::<_, String>(0));
+/// 公开版本（两阶段）：锁内准备 + mock 平台入库 → 锁外真实平台联网调用 → 锁内真实结果入库。
+/// 真实调用失败不静默回落 mock，插入带失败标记的结果行（对齐 Node 语义）。
+pub fn run_checkpoint_full(cp_id: &str) -> Result<(), String> {
+    struct RealJob {
+        qid: String,
+        qtext: String,
+        platform: i64,
+    }
+    // Phase 1（锁内）：元数据 + mock 平台
+    type Phase1 = (String, i64, String, Project, Vec<RealJob>, i64, i64);
+    let phase1 = db::with_db(|conn| -> Result<Phase1, String> {
+        let (tid, day): (String, i64) = conn
+            .query_row("SELECT taskId, day FROM monitorCheckpoints WHERE id=?", [cp_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(|_| "监测检查点不存在".to_string())?;
+        let (pid, qids_raw, plats_raw): (String, String, String) = conn
+            .query_row("SELECT projectId, questionIds, platforms FROM monitorTasks WHERE id=?", [&tid], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .map_err(|_| "监测任务不存在".to_string())?;
+        let p = get_project(conn, &pid).ok_or("项目不存在")?;
+        let qids: Vec<String> = serde_json::from_str(&qids_raw).unwrap_or_default();
+        let platforms: Vec<i64> = serde_json::from_str(&plats_raw).unwrap_or_else(|_| vec![1]);
+        let mut results_n = 0i64;
+        let mut exact_hits = 0i64;
+        let mut real_jobs: Vec<RealJob> = Vec::new();
+        for qid in &qids {
+            let qtext: String = match conn.query_row("SELECT text FROM questions WHERE id=?", [qid], |r| r.get(0)) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            for platform in &platforms {
+                if llm::real_monitor_configured(conn, *platform) {
+                    real_jobs.push(RealJob { qid: qid.clone(), qtext: qtext.clone(), platform: *platform });
+                    continue;
+                }
+                let r = run_monitor(conn, &p, &qtext, *platform, day as u32);
+                results_n += 1;
+                exact_hits += r.exact_url_hit;
+                insert_monitor_result(conn, &tid, cp_id, &pid, qid, &r, "mock");
+                if let Some(org) = org_of_project(conn, &pid) {
+                    usage_increment(conn, &org, "monitor.calls");
+                }
+                conn.execute("UPDATE questions SET status=2 WHERE id=? AND status=1", [qid]).ok();
+                if r.hit_status >= 2 {
+                    conn.execute("UPDATE questions SET status=3 WHERE id=?", [qid]).ok();
+                }
+            }
+        }
+        Ok((tid, day, pid, p, real_jobs, results_n, exact_hits))
+    })?;
+    let (tid, day, pid, p, real_jobs, mut results_n, mut exact_hits) = phase1;
+    if real_jobs.is_empty() {
+        db::with_db(|conn| finish_checkpoint(conn, cp_id, &tid, day, &pid, results_n, exact_hits));
+        return Ok(());
+    }
+
+    // Phase 2（锁外）：凭据读取与联网调用
+    let creds: Vec<(i64, String, String, String)> = db::with_db(|conn| {
+        real_jobs
+            .iter()
+            .map(|j| {
+                let (k, b, m) = llm::monitor_creds(conn, j.platform).unwrap_or_default();
+                (j.platform, k, b, m)
+            })
+            .collect()
+    });
+    let published: Vec<String> = db::with_db(|conn| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT t.publishedUrl FROM articles a JOIN publishTasks t ON t.articleId=a.id WHERE a.projectId=? AND a.status=3 AND t.status=3 AND t.publishedUrl IS NOT NULL",
+            )
+            .unwrap_or_else(|_| panic!("published urls"));
+        let rs = stmt.query_map([&pid], |r| r.get::<_, String>(0));
         rs.map(|x| x.filter_map(|y| y.ok()).collect()).unwrap_or_default()
+    });
+    let mut real_results: Vec<(String, MonitorMock)> = Vec::new();
+    for j in &real_jobs {
+        let (key, base, model) = creds
+            .iter()
+            .find(|(pl, _, _, _)| *pl == j.platform)
+            .map(|(_, k, b, m)| (k.clone(), b.clone(), m.clone()))
+            .unwrap_or_default();
+        let r = match llm::run_monitor_real_with(&p, &j.qtext, j.platform, &key, &base, &model, &published) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("[monitor-real] 平台 {} 调用失败：{}", j.platform, e);
+                MonitorMock {
+                    platform: j.platform,
+                    answer_text: format!("[真实监测调用失败] {}", e),
+                    brand_mentioned: 0,
+                    mention_position: "未执行".to_string(),
+                    brand_accurate: None,
+                    recommend_level: 0,
+                    recommend_reason: String::new(),
+                    competitors: json!([]),
+                    citations: json!([]),
+                    keywords: json!({"_question": j.qtext}),
+                    hit_status: 0,
+                    exact_url_hit: 0,
+                    next_step: "检查该平台 API 配置（MONITOR_*_KEY/model/联网开关）后重试".to_string(),
+                    next_optimize: String::new(),
+                }
+            }
+        };
+        results_n += 1;
+        exact_hits += r.exact_url_hit;
+        real_results.push((j.qid.clone(), r));
+    }
+
+    // Phase 3（锁内）：真实结果入库 + 收尾
+    db::with_db(|conn| {
+        for (qid, m) in &real_results {
+            insert_monitor_result(conn, &tid, cp_id, &pid, qid, m, "real-llm");
+            if let Some(org) = org_of_project(conn, &pid) {
+                usage_increment(conn, &org, "monitor.calls");
+            }
+            conn.execute("UPDATE questions SET status=2 WHERE id=? AND status=1", [qid]).ok();
+            if m.hit_status >= 2 {
+                conn.execute("UPDATE questions SET status=3 WHERE id=?", [qid]).ok();
+            }
+        }
+        finish_checkpoint(conn, cp_id, &tid, day, &pid, results_n, exact_hits);
+    });
+    Ok(())
+}
+
+/// 锁内：加载到期检查点 ID（供调用方在锁外逐个 run_checkpoint_full）
+pub fn run_due_checkpoints_due(conn: &Connection, pid: &str) -> Vec<String> {
+    let mut stmt = match conn.prepare(
+        "SELECT cp.id FROM monitorCheckpoints cp JOIN monitorTasks t ON cp.taskId=t.id WHERE t.projectId=? AND cp.status=1 AND cp.day>0 AND cp.dueAt<=?",
+    ) {
+        Ok(s) => s,
+        Err(_) => return vec![],
     };
+    let rs = stmt.query_map([pid, &now()], |r| r.get::<_, String>(0));
+    rs.map(|x| x.filter_map(|y| y.ok()).collect()).unwrap_or_default()
+}
+
+/// 公开版本：加载 + 逐个两阶段执行（真实平台网调在锁外）
+pub fn run_due_checkpoints(pid: &str) {
+    let due = db::with_db(|conn| run_due_checkpoints_due(conn, pid));
     for cp in due {
-        let _ = run_checkpoint(conn, &cp);
+        let _ = run_checkpoint_full(&cp);
     }
 }
 
-pub fn force_run_next_checkpoint(conn: &Connection, tid: &str) -> Result<(), String> {
-    let cp: String = conn
-        .query_row("SELECT id FROM monitorCheckpoints WHERE taskId=? AND status=1 ORDER BY day LIMIT 1", [tid], |r| r.get(0))
-        .map_err(|_| "该任务没有待执行的检查点".to_string())?;
-    run_checkpoint(conn, &cp)
+/// 公开版本：取下一个待执行检查点并两阶段执行
+pub fn force_run_next_checkpoint(tid: &str) -> Result<(), String> {
+    let cp: String = db::with_db(|conn| {
+        conn.query_row("SELECT id FROM monitorCheckpoints WHERE taskId=? AND status=1 ORDER BY day LIMIT 1", [tid], |r| r.get(0))
+            .map_err(|_| "该任务没有待执行的检查点".to_string())
+    })?;
+    run_checkpoint_full(&cp)
 }
 
 // ============ 信源资产沉淀 ============
@@ -1936,7 +2207,7 @@ pub fn reputation_report(conn: &Connection, pid: &str, task_id: &str) -> Result<
 }
 
 // 口碑监测（8 个口碑问题 + 监测任务）
-pub fn create_reputation_monitor(conn: &Connection, pid: &str, platforms: Vec<i64>, mode: i64) -> Result<(usize, String), String> {
+pub fn create_reputation_monitor_locked(conn: &Connection, pid: &str, platforms: Vec<i64>, mode: i64, run_now: bool) -> Result<(usize, String, String), String> {
     let p = get_project(conn, pid).ok_or("项目不存在")?;
     let brand = if p.brand_name.is_empty() { "该品牌" } else { &p.brand_name };
     let templates = [
@@ -1963,7 +2234,7 @@ pub fn create_reputation_monitor(conn: &Connection, pid: &str, platforms: Vec<i6
     if qids.is_empty() {
         return Err("口碑问题创建失败".to_string());
     }
-    let tid = create_monitor_task(
+    let (tid, first_cp) = create_monitor_task_locked(
         conn,
         pid,
         &CreateMonitorInput {
@@ -1972,8 +2243,9 @@ pub fn create_reputation_monitor(conn: &Connection, pid: &str, platforms: Vec<i6
             mode,
             schedule_days: if mode == 2 { vec![3, 7, 14] } else { vec![] },
         },
+        run_now,
     )?;
-    Ok((added, tid))
+    Ok((added, tid, first_cp))
 }
 
 // ============ 卡密 ============
@@ -2128,7 +2400,7 @@ pub fn auto_geo(conn: &Connection, user_id: &str, raw: &str) -> Result<AutoGeoRe
     ensure_kbs(conn, &pid);
 
     // 3. 知识库整理
-    organize_knowledge(conn, &pid, 1, &brand_name, raw);
+    organize_knowledge_locked(conn, &pid, 1, &brand_name, raw);
     let knowledge_docs: usize = conn
         .query_row(
             "SELECT COUNT(*) FROM kbDocuments WHERE kbId IN (SELECT id FROM knowledgeBases WHERE projectId=?)",
@@ -2138,7 +2410,7 @@ pub fn auto_geo(conn: &Connection, user_id: &str, raw: &str) -> Result<AutoGeoRe
         .unwrap_or(0) as usize;
 
     // 4. 50 问
-    let question_count = generate_questions_50(conn, &pid);
+    let question_count = generate_questions_50_locked(conn, &pid);
 
     // 5. 品牌文章 + 三道审核
     let qid: String = conn
@@ -2149,11 +2421,11 @@ pub fn auto_geo(conn: &Connection, user_id: &str, raw: &str) -> Result<AutoGeoRe
         )
         .or_else(|_| conn.query_row("SELECT id FROM questions WHERE projectId=? ORDER BY createdAt LIMIT 1", [&pid], |r| r.get(0)))
         .map_err(|_| "问题生成失败".to_string())?;
-    let (aid, article_title) = create_content(conn, &pid, &qid, 2)?;
+    let (aid, article_title) = create_content_locked(conn, &pid, &qid, 2)?;
     let audit = audit_article(conn, &aid, "一键 GEO").ok();
 
     // 6. 上榜监测
-    let monitor_task_id = create_monitor_task(
+    let monitor_task_id = create_monitor_task_locked(
         conn,
         &pid,
         &CreateMonitorInput {
@@ -2162,7 +2434,9 @@ pub fn auto_geo(conn: &Connection, user_id: &str, raw: &str) -> Result<AutoGeoRe
             mode: 1,
             schedule_days: vec![],
         },
+        true,
     )
+    .map(|(t, _)| t)
     .ok();
 
     Ok(AutoGeoResult {
@@ -2322,5 +2596,164 @@ mod notify_tests {
     fn test_notify_fire_unreachable_is_err() {
         // 不可达端口：返回 Err 而非 panic（后台线程吞掉错误）
         assert!(notify_fire("http://127.0.0.1:1", "{}").is_err());
+    }
+}
+
+#[cfg(test)]
+mod real_content_tests {
+    use super::*;
+    use crate::llm::LlmConfig;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    fn spawn_article_server(title: &str, content: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let inner = serde_json::json!({"title": title, "content": content}).to_string();
+        let body = serde_json::json!({
+            "choices": [{"message": {"content": inner}}]
+        })
+        .to_string();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf: Vec<u8> = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let mut body_left: i64 = -1;
+            loop {
+                let n = sock.read(&mut chunk).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&buf).to_string();
+                if body_left < 0 {
+                    if let Some(pos) = text.find("\r\n\r\n") {
+                        body_left = text
+                            .lines()
+                            .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+                            .and_then(|l| l.split(':').nth(1))
+                            .and_then(|v| v.trim().parse::<i64>().ok())
+                            .unwrap_or(0);
+                        body_left -= (buf.len() - pos - 4) as i64;
+                        if body_left <= 0 {
+                            break;
+                        }
+                    }
+                } else {
+                    body_left -= n as i64;
+                    if body_left <= 0 {
+                        break;
+                    }
+                }
+            }
+            sock.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes()).unwrap();
+        });
+        format!("http://127.0.0.1:{}", port)
+    }
+
+    fn setup_project_with_llm(base_url: &str) -> (String, String) {
+        crate::db::test_init();
+        let pid = gen_id();
+        let qid = gen_id();
+        db::with_db(|conn| {
+            conn.execute(
+                "INSERT INTO companies (id, ownerUserId, name, createdAt) VALUES (?,?,?,?)",
+                rusqlite::params![gen_id(), "u-test", "测试公司", now()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO projects (id, companyId, name, brandName, productName, region, business, sellingPoints, keywords, createdAt) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                rusqlite::params![pid, conn.query_row("SELECT id FROM companies ORDER BY rowid DESC LIMIT 1", [], |r| r.get::<_, String>(0)).unwrap(), "LLM测试项目", "跃动童年", "跃动童年体感运动课", "上海", "3-8岁儿童体感运动", "无需设备", "儿童运动", now()],
+            )
+            .unwrap();
+            crate::mock::ensure_kbs(conn, &pid);
+            conn.execute(
+                "INSERT INTO questions (id, projectId, text, category, stage, priority, status, createdAt) VALUES (?,?,?,?,?,?,1,?)",
+                rusqlite::params![qid, pid, "跃动童年是什么公司？", 1, 1, 1, now()],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO settings (key, value, updatedAt) VALUES ('LLM_API_KEY', 'sk-test', ?)", [now()]).unwrap();
+            conn.execute(
+                "INSERT INTO settings (key, value, updatedAt) VALUES ('LLM_BASE_URL', ?, ?)",
+                rusqlite::params![base_url, now()],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO settings (key, value, updatedAt) VALUES ('LLM_MODEL', 'test-model', ?)", [now()]).unwrap();
+        });
+        (pid, qid)
+    }
+
+    #[test]
+    fn test_create_content_full_llm_then_fallback() {
+        // Phase 1：LLM 可达 → 真实生成，meta.source=llm
+        let (base, server) = {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = l.local_addr().unwrap().port();
+            drop(l);
+            (format!("http://127.0.0.1:{}", port), port)
+        };
+        std::thread::spawn(move || {
+            let listener = TcpListener::bind(format!("127.0.0.1:{}", server)).unwrap();
+            for stream in listener.incoming() {
+                let mut sock = stream.unwrap();
+                let mut buf: Vec<u8> = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let mut body_left: i64 = -1;
+                loop {
+                    let n = sock.read(&mut chunk).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&buf).to_string();
+                    if body_left < 0 {
+                        if let Some(pos) = text.find("\r\n\r\n") {
+                            body_left = text
+                                .lines()
+                                .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+                                .and_then(|l| l.split(':').nth(1))
+                                .and_then(|v| v.trim().parse::<i64>().ok())
+                                .unwrap_or(0);
+                            body_left -= (buf.len() - pos - 4) as i64;
+                            if body_left <= 0 {
+                                break;
+                            }
+                        }
+                    } else {
+                        body_left -= n as i64;
+                        if body_left <= 0 {
+                            break;
+                        }
+                    }
+                }
+                let inner = serde_json::json!({"title": "LLM真实标题", "content": "# LLM真实正文\n这是真实模型生成的正文内容，包含跃动童年的品牌事实。"}).to_string();
+                let body = serde_json::json!({
+                    "choices": [{"message": {"content": inner}}]
+                })
+                .to_string();
+                sock.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes()).unwrap();
+            }
+        });
+        let (pid, qid) = setup_project_with_llm(&base);
+        let (aid, title) = create_content_full(&pid, &qid, 2).unwrap();
+        assert_eq!(title, "LLM真实标题");
+        db::with_db(|conn| {
+            let meta: String = conn.query_row("SELECT meta FROM articles WHERE id=?", [&aid], |r| r.get(0)).unwrap();
+            assert!(meta.contains("\"llm\""), "meta.source 应为 llm：{}", meta);
+        });
+
+        // Phase 2：LLM 不可达 → 回落模板（不 panic、文章照常入库）
+        db::with_db(|conn| {
+            conn.execute(
+                "UPDATE settings SET value='http://127.0.0.1:1' WHERE key='LLM_BASE_URL'",
+                [],
+            )
+            .unwrap();
+        });
+        let (_aid2, title2) = create_content_full(&pid, &qid, 2).unwrap();
+        assert!(title2.starts_with("跃动童年是什么公司"), "回落模板标题：{}", title2);
+        db::with_db(|conn| {
+            conn.execute("DELETE FROM settings WHERE key LIKE 'LLM_%'", []).ok();
+        });
     }
 }
