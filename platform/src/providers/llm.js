@@ -198,6 +198,32 @@ function extractTitle(question, brandName) {
 
 // ============ 生成能力 ============
 
+// 50 问 LLM 输出解析（宽容适配）：支持「1. xxx（维度）」「1、xxx」「- xxx」「裸行」；
+// 跳过标题/表格/小节头；尾部（xxx）识别为意图维度。v1.6.5：修复 ReferenceError（真实路径从未可用）。
+export function parseQuestionLines(text) {
+  const out = [];
+  for (const raw of String(text || '').split('\n')) {
+    let line = raw.trim();
+    if (!line || line.startsWith('#') || line.startsWith('|')) continue;
+    if (/^[一二三四五六七八九十]、/.test(line)) continue;
+    if (/^(结构规范|核心规则|任务要求)/.test(line)) continue;
+    line = line.replace(/^\(?\d+\s*[.、．)）]\s*/, '').replace(/^[-•]\s*/, '');
+    if (line.length < 6) continue;
+    let dim = '';
+    const m = line.match(/（([^）]+)）\s*$/);
+    if (m) {
+      dim = m[1];
+      line = line.slice(0, m.index).trim();
+    }
+    line = line.replace(/[。？?]+$/, '');
+    if (line.length >= 6) out.push({ text: line, dimension: dim });
+    if (out.length >= 50) break;
+  }
+  return out;
+}
+
+
+
 // 50 问生成（文档二 1.2）
 export async function generateQuestions50(project) {
   if (isReal()) {
